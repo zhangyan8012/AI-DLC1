@@ -687,6 +687,15 @@ export interface ReposManifestAskDirective extends AskDirectiveBase {
   choices: AskChoice[];
 }
 
+// Who builds which Unit, answered in the person's own words: the agent fills
+// assign_command with one <unit>=<team> per Unit they named.
+export interface UnitAssignmentAskDirective extends AskDirectiveBase {
+  ask_type: "unit-assignment";
+  response_route: "command";
+  choices: AskChoice[];
+  assign_command: string;
+}
+
 export interface NewWorkRoutingAskDirective extends AskDirectiveBase {
   ask_type: "new-work-routing";
   response_route: "next";
@@ -793,6 +802,7 @@ export type AskDirective =
   | ProjectTypeAskDirective
   | ConstructionStaffingAskDirective
   | ReposManifestAskDirective
+  | UnitAssignmentAskDirective
   | NewWorkRoutingAskDirective
   | UnitClaimAskDirective
   | LegacyPlanApprovalRecoveryAskDirective
@@ -1043,6 +1053,7 @@ const ASK_FIELDS = [
   "ask_type",
   "response_route",
   "confirm_command",
+  "assign_command",
   "compose_command",
   "scope_commands",
   "select_commands",
@@ -1148,6 +1159,13 @@ export function questionNote(invocation: string): string {
     "act only on their reply. When their reply picks one of the choices (its number, its words, or their own words " +
     "for it), run that choice's command; act on the step it returns, or run `" + invocation + " next` when it " +
     "returns none. Anything else is their own words: read what they meant.";
+}
+
+// Who builds which Unit: the person's own words name a team per Unit.
+export function unitAssignmentQuestionNote(invocation: string): string {
+  return questionNote(invocation) + " Their words name who builds which Unit: run assign_command with one " +
+    "<unit>=<team> for each Unit they gave a team (the team as they named it) and their words, single-quoted, as " +
+    "--person-words; a Unit they left out or called open stays open.";
 }
 
 // The routing question asked while no piece of work is selected: continue and
@@ -1393,7 +1411,7 @@ export function ceremonyNote(state: "on" | "off"): string {
 // the numbers: a reply of "2" is read against this order, and the agent
 // renders nothing of its own. One builder, so every question has one shape.
 // Engine questions answered by running the picked choice's command.
-const COMMAND_CHOICE_ASKS = new Set(["construction-staffing", "repos-manifest"]);
+const COMMAND_CHOICE_ASKS = new Set(["construction-staffing", "repos-manifest", "unit-assignment"]);
 
 export interface AskChoice {
   label: string;
@@ -1540,6 +1558,8 @@ export function withAgentNotes<T extends object>(
       ? planOfferQuestionNote(invocation)
       : d.ask_type === "new-work-routing" && Array.isArray(d.available_intents)
       ? routingRecordsQuestionNote(invocation)
+      : d.ask_type === "unit-assignment"
+      ? unitAssignmentQuestionNote(invocation)
       : questionNote(invocation);
     if (!Array.isArray(d.choices)) {
       const choices = askChoices(d, invocation, logInvocation);
@@ -1813,6 +1833,7 @@ export function validateDirective(obj: unknown): ValidationResult {
         "detail",
         "existing_code_command",
         "new_project_command",
+        "assign_command",
       ] as const;
       const rejectUnexpected = (
         askType: string,
@@ -1890,7 +1911,8 @@ export function validateDirective(obj: unknown): ValidationResult {
         if (o.response_route !== "command") {
           errors.push(`${kind}: ${o.ask_type} response_route must be "command"`);
         }
-        rejectUnexpected(String(o.ask_type), {});
+        if (o.ask_type === "unit-assignment") checkString(o, "assign_command", kind, errors);
+        rejectUnexpected(String(o.ask_type), o.ask_type === "unit-assignment" ? { assign_command: true } : {});
       } else if (o.ask_type === "new-work-routing") {
         if (o.response_route !== "next") {
           errors.push(`${kind}: new-work-routing response_route must be "next"`);

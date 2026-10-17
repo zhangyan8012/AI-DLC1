@@ -257,6 +257,7 @@ import {
   installedKiroLayout,
   intentRepos,
   discoverSiblingRepos,
+  teamSkeletonOn,
   codekbStoreIsCurrent,
   inspectContinuationCursor,
   isPerUnitStage,
@@ -526,7 +527,14 @@ import {
 } from "./aidlc-runtime-paths.ts";
 import { localRepoOverrideLines, REPOS_FILE } from "./aidlc-workspace-manifest.ts";
 import { noteReposManifestOffered, reposManifestOffered } from "./aidlc-workspace-repos.ts";
-import { unknownLikelyReposLine } from "./aidlc-unit-teams.ts";
+import {
+  homeLocation,
+  unitDependencies,
+  unitLikelyRepos,
+  unitsAssignedSinceTeams,
+  unitsInPlanOrder,
+  unknownLikelyReposLine,
+} from "./aidlc-unit-teams.ts";
 import { terminalDispatcherArgv } from "./aidlc.ts";
 import { appendAuditEntries, appendAuditEntry } from "./aidlc-audit.ts";
 import { inspectRequiredArtifactInstances } from "./aidlc-artifact-resolution.ts";
@@ -4035,6 +4043,11 @@ function constructionStaffingAsk(
   if (stateContent === null || !node || node.phase !== "construction" || !isPerUnit(node)) return null;
   if (usesStageLevelPerUnitArtifacts(scope, stateContent)) return null;
   const ownership = (getField(stateContent, UNIT_OWNERSHIP_FIELD) ?? "").trim();
+  // Teams building each Unit as work of their own: who builds which Unit is
+  // the one question, asked once at the home.
+  if (ownership === "team" && homeLocation(stateContent) !== null) {
+    return unitAssignmentAsk(projectDir, stateContent);
+  }
   const teams = ownership === "team" && getField(stateContent, "Unit Gate Rhythm") === null;
   if (ownership !== "" && !teams) return null;
   const evidence = routingEvidenceFor(projectDir, stateContent);
@@ -4093,6 +4106,49 @@ function constructionStaffingAsk(
         command: `${state} set-unit-ownership team`,
       },
     ],
+  };
+}
+
+// Who builds which Unit, asked once at the home after the person chose teams,
+// before any Unit starts: the person answers in their own words and the agent
+// records them as one claim per named Unit; a Unit left out stays open for any
+// team to take later. The walking skeleton, when on, is built here first and
+// is not asked about. Null when the step goes on.
+function unitAssignmentAsk(projectDir: string, stateContent: string): AskDirective | null {
+  if (readApplicableTeamUnitScopeStamp(projectDir, stateContent) !== null) return null;
+  const evidence = routingEvidenceFor(projectDir, stateContent);
+  const rows = evidence?.allRows ?? readAuditShardEvents(projectDir);
+  if (rows.some((row) => row.event === "UNIT_STARTED")) return null;
+  if (unitsAssignedSinceTeams(rows)) return null;
+  const dag = resolveBoltBatches(projectDir, evidence);
+  if (dag.state !== "ok" || dag.units.length < 2) return null;
+  const skeleton = teamSkeletonOn(stateContent) ? dag.batches[0][0] : null;
+  const likely = unitLikelyRepos(projectDir);
+  const dependencies = unitDependencies(projectDir);
+  const units = unitsInPlanOrder(projectDir, dag.units).filter((unit) => unit !== skeleton);
+  const described = units.map((unit) => {
+    const notes = [
+      ...(likely.has(unit) ? [`likely ${likely.get(unit)!.join(", ")}`] : []),
+      ...((dependencies.get(unit) ?? []).length > 0 ? [`waits on ${dependencies.get(unit)!.join(", ")}`] : []),
+    ];
+    return notes.length > 0 ? `${unit} (${notes.join("; ")})` : unit;
+  });
+  const unitTool = aidlcToolInvocation("unit");
+  return {
+    kind: "ask",
+    ask_type: "unit-assignment",
+    response_route: "command",
+    question: `${skeleton !== null ? `${skeleton} is the walking skeleton, built here first. ` : ""}` +
+      `Who builds which Unit? ${described.join(", ")}. Name a team for each, or leave a Unit open for any team ` +
+      "to take later.",
+    choices: [
+      {
+        label: "Name the teams",
+        detail: "Say it your way, for example \"refunds: payments, checkout-ui: web, leave reporting open\".",
+      },
+      { label: "Leave them all open", detail: "Any team takes a Unit when it is ready.", command: `${unitTool} assign --open` },
+    ],
+    assign_command: `${unitTool} assign <unit>=<team> [<unit>=<team> ...] --person-words '<their words>'`,
   };
 }
 
@@ -10426,9 +10482,12 @@ function routeNext(agentArgs: string[], projectDir: string | undefined): void {
     return;
   }
 
+  // Teams building each Unit as work of their own: the home walks the Units no
+  // team holds, and shows the board once none is left to it (the walk below).
   if (
     stateContent &&
-    isTeamUnitOwnership(stateContent)
+    isTeamUnitOwnership(stateContent) &&
+    homeLocation(stateContent) === null
   ) {
     if (unitScope) {
       try {
@@ -12932,7 +12991,12 @@ function emitTeamUnitMajorRunStage(
       return;
     }
   }
-  const units = scopeStamp ? [scopeStamp.unit] : resolution.batches.flat();
+  // Teams build their Units as work of their own: the home walks only the
+  // Units no team holds.
+  const heldElsewhere = !scopeStamp && homeLocation(stateContent) !== null && hasAnyUnitClaimRefs(projectDir)
+    ? new Set(cachedUnitClaimOverview(projectDir, { writeCache: !isReadOnlyEngineProbe() }).claimed.map((row) => row.unit))
+    : new Set<string>();
+  const units = scopeStamp ? [scopeStamp.unit] : resolution.batches.flat().filter((unit) => !heldElsewhere.has(unit));
   const kinds = resolution.unitKinds;
   const rhythm = effectiveUnitGateRhythm(projectDir, stateContent);
   const auditRows = readAuditShardEvents(projectDir).sort((a, b) => {
@@ -12994,8 +13058,19 @@ function emitTeamUnitMajorRunStage(
   }
 
   const finalStage = block[block.length - 1];
+  // A Unit of the home's that waits, directly or through another, on a Unit a
+  // team still builds is not started here yet.
+  const dependencies = heldElsewhere.size > 0 ? unitDependencies(projectDir) : new Map<string, string[]>();
+  const waitsOnTeam = (unit: string, seen = new Set<string>()): boolean =>
+    (dependencies.get(unit) ?? []).some((dep) => {
+      if (heldElsewhere.has(dep) && !model?.mergedUnits.has(dep)) return true;
+      if (seen.has(dep)) return false;
+      seen.add(dep);
+      return waitsOnTeam(dep, seen);
+    });
   for (const unit of units) {
     if (model?.mergedUnits.has(unit)) continue;
+    if (waitsOnTeam(unit)) continue;
     const unitKind = kinds?.get(unit) ?? null;
     for (const stage of block) {
       if (!teamUnitStageApplies(stage, unitKind)) continue;
@@ -13126,6 +13201,13 @@ function emitTeamUnitMajorRunStage(
 
   if (!finalStage) {
     emit(errorDirective("Team unit-major mode has no active per-unit Construction stages."));
+    return;
+  }
+  // Every Unit left to the home is built: while a team still builds one, the
+  // board is the step.
+  if ([...heldElsewhere].some((unit) => !model?.mergedUnits.has(unit))) {
+    const board = buildTeamConstructionBoard(projectDir, refreshedState, { readOnly: isReadOnlyEngineProbe() });
+    emit(noticeDirective(renderTeamConstructionBoard(board, "dispatcher")));
     return;
   }
   if (scopeStamp) {

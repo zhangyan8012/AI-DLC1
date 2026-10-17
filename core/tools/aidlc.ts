@@ -248,6 +248,7 @@ export const ROUTES: readonly Route[] = [
     classification: "passthrough",
     verbs: [
       "adopt",
+      "assign",
       "claim",
       "gate",
       "land",
@@ -264,6 +265,7 @@ export const ROUTES: readonly Route[] = [
     mutationScope: "project",
     all: [
       "unit adopt <unit>",
+      "unit assign <unit>=<team> [<unit>=<team> ...] [--person-words <text>] | --open",
       "unit claim <unit>",
       "unit gate <unit> --decision <approve|reject> --user-input <text>",
       "unit land <unit> [--step git|state|audit|all] [--target <branch>] [--accept-released-attempt --user-input <text>]",

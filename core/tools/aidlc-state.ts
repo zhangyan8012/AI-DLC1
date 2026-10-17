@@ -238,6 +238,7 @@ import {
   recordHookDrop,
   engineDir,
 } from "./aidlc-lib.js";
+import { HOME_LOCATION_FIELD, homeLocation, workspaceHomeLocation } from "./aidlc-unit-teams.js";
 import { memoryDirFor, STAGE_WIDE_SENSOR_IDS, templateEligibleArtifacts } from "./aidlc-graph.ts";
 import { inspectRequiredArtifactInstances } from "./aidlc-artifact-resolution.ts";
 import { aidlcToolInvocation, compiledExecutable, entrySkillInvocation } from "./aidlc-runtime-paths.ts";
@@ -1628,8 +1629,14 @@ function handleSetUnitOwnership(args: string[]): void {
       "Unit Ownership",
       value,
     );
+    // The home of team-built work, recorded once as teams are chosen: every copy
+    // of the workspace then knows where its claims are.
+    const home = value === "team" && current !== "team" && homeLocation(content) === null
+      ? workspaceHomeLocation(pd)
+      : null;
+    if (home !== null) content = setOrInsertField(content, "## Runtime State", HOME_LOCATION_FIELD, home);
     if (value === "solo") content = removeUnitProgressSection(content);
-    emitAudit(pd, "UNIT_OWNERSHIP_SET", { Mode: value });
+    emitAudit(pd, "UNIT_OWNERSHIP_SET", { Mode: value, ...(home !== null ? { [HOME_LOCATION_FIELD]: home } : {}) });
     writeStateFile(pd, content);
     if (switches.length > 0) keepPlanQuestionOver(pd, before, content);
     // Each switch's own line, as the two setters print it. How team approvals
