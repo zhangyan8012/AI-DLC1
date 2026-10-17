@@ -438,6 +438,7 @@ import {
   KIRO_CONDUCTOR_AGENT_FILE,
   PERSON_ASKED_SKIP_REASON,
 } from "./aidlc-lib.ts";
+import { repoNotThereLine } from "./aidlc-workspace-manifest.ts";
 import { GUARD_POLICY_GLOSS, SCOPE_GLOSS } from "./aidlc-guard-fences.ts";
 import { validateStageFrontmatter } from "./aidlc-stage-schema.ts";
 import { isRuleStale } from "./aidlc-rule-schema.ts";
@@ -9277,8 +9278,9 @@ function handleIntentRepos(
       if (boxes.get("units-generation") === "completed") return { kind: "cutoff" as const };
       if (verb === "add-repo") {
         if (current.includes(name)) return { kind: "already" as const };
+        if (!existsSync(repoDir(projectDir, name))) die(`intent add-repo refused: ${repoNotThereLine(projectDir, name)}`);
         if (!isGitRepoDir(repoDir(projectDir, name))) {
-          die(`intent add-repo refused: "${name}" is not a Git checkout under the workspace folder (no .git entry at ${repoDir(projectDir, name)}). Clone or create the repo there first.`);
+          die(`intent add-repo refused: "${name}" is not a Git checkout (no .git entry at ${repoDir(projectDir, name)}). Clone or create the repo there first.`);
         }
       } else {
         if (!current.includes(name)) return { kind: "absent" as const, current };

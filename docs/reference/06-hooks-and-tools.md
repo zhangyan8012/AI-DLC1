@@ -1668,7 +1668,10 @@ without a word: a shell command that names no file it writes and is not AI-DLC's
 own (a read such as `sed -n` or `find`, a scan, a test run, `python script.py`),
 a file-tool or shell write whose every target is outside the project (the
 path as written and the real path of its deepest existing folder both lie
-outside the project; a link from outside into the project counts as inside),
+outside the project; a link from outside into the project counts as inside;
+a repo `repos.json` or `repos.local.json` maps to a path of its own counts as
+the project wherever it sits, so a build writing into it waits for its plan as
+one writing into a repo inside the workspace does),
 and on the kiro-ide row a call to one of the person's MCP servers (the Kiro
 adapter marks it `aidlc_external_tool: "mcp"`; Kiro's own approval card and the
 person's Kiro settings decide whether it runs).
