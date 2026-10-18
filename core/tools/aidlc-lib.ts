@@ -26955,10 +26955,32 @@ export function writeBaselineSourceSnapshot(
   return writeSourceSnapshot(record, join(dir, `baseline-${hash.slice(0, 12)}.tsv`), serialized);
 }
 
+/** The same listing kept under each slug, so every stage the boundary reaches reads it. Returns the one fingerprint. */
+function writeBaselineSourceSnapshotUnderStages(
+  projectDir: string,
+  stageSlugs: readonly string[],
+  listing: ReadonlyMap<string, string>,
+  intent?: string,
+  space?: string,
+): string {
+  const fingerprints = stageSlugs.map((slug) => writeBaselineSourceSnapshot(projectDir, slug, listing, intent, space));
+  return fingerprints[0];
+}
+
+/** The workspace_requires stages a boundary at `targetSlug` reaches (all of them without one), plus code-generation. */
+export function workspaceBaselineStageSlugs(targetSlug?: string): string[] {
+  const graph = loadStageGraph();
+  const from = targetSlug === undefined ? -1 : graph.findIndex((stage) => stage.slug === targetSlug);
+  const slugs = graph
+    .filter((stage, index) => stage.workspace_requires === true && index >= from)
+    .map((stage) => stage.slug);
+  return slugs.includes("code-generation") ? slugs : ["code-generation", ...slugs];
+}
+
 /** Build the modern source-baseline audit field for any workflow/stage boundary. */
 export function sourceBaselineAuditFields(
   projectDir: string,
-  stageSlug: string,
+  stageSlug: string | readonly string[],
   intent?: string,
   space?: string,
   // The repo set of a record not listed yet (start-work lists it last).
@@ -26975,9 +26997,9 @@ export function sourceBaselineAuditFields(
       return { "Source Baseline": UNBINDABLE_FINGERPRINT };
     }
     return {
-      "Source Baseline": writeBaselineSourceSnapshot(
+      "Source Baseline": writeBaselineSourceSnapshotUnderStages(
         projectDir,
-        stageSlug,
+        typeof stageSlug === "string" ? [stageSlug] : stageSlug,
         new Map(),
         intent,
         space,
@@ -26985,9 +27007,9 @@ export function sourceBaselineAuditFields(
     };
   }
   return {
-    "Source Baseline": writeBaselineSourceSnapshot(
+    "Source Baseline": writeBaselineSourceSnapshotUnderStages(
       projectDir,
-      stageSlug,
+      typeof stageSlug === "string" ? [stageSlug] : stageSlug,
       sourceState.listing,
       intent,
       space,
