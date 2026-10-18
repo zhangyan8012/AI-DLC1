@@ -1577,7 +1577,7 @@ function handleSetUnitOwnership(args: string[]): void {
     }
     if (value === "team") {
       const repos = intentRepos(pd);
-      if (repos.length > 0) {
+      if (repos.length > 0 && workspaceHomeLocation(pd) === null) {
         error(`${teamsAcrossReposLine(repos.length)} Carry on with \`${entrySkillInvocation()}\`.`);
       }
       const resolution = resolveBoltDag(pd);
