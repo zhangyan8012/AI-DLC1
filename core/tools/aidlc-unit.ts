@@ -3,8 +3,10 @@
 import { spawnSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import {
+  existsSync,
   mkdtempSync,
   mkdirSync,
+  readdirSync,
   readFileSync,
   realpathSync,
   rmSync,
@@ -14,7 +16,7 @@ import {
 import { basename, dirname, join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
-import { appendAuditEntry } from "./aidlc-audit.ts";
+import { appendAuditEntry, appendAuditEntryUnlocked } from "./aidlc-audit.ts";
 import {
   activeIntentUuid,
   activeSpace,
@@ -47,9 +49,17 @@ import {
   readApplicableTeamUnitScopeStamp,
   readUnitMergeTransaction,
   readStateFile,
+  readUnitSourceManifest,
+  recordDir,
+  hasAnyUnitClaimRefs,
+  UNIT_GATE_RHYTHM_FIELD,
+  readAllAuditShards,
+  staleStageLine,
   readUnitGateRhythm,
   readUnitScopeStamp,
+  readAnswerTextFile,
   parseReviewRecordBytes,
+  personAskedSinceGate,
   pairedReviewRecordForCompletion,
   relativeRecordDir,
   REVIEW_RECORDS_DIR,
@@ -78,7 +88,60 @@ import {
   writeStateFile,
   writeUnitScopeStamp,
   writeClaimGeneration,
+  intentsDir,
+  loadScopeMapping,
+  parseCheckboxes,
+  readActiveIntentCursor,
+  readIntentRegistry,
+  slugify,
+  DEFAULT_SPACE,
+  isGitRepoDir,
+  repoDir,
+  selectIntentForSession,
+  sessionsDir,
+  setActiveSpaceCursor,
+  writeFileAtomic,
 } from "./aidlc-lib.js";
+import {
+  type Amendment,
+  approvedInputsOf,
+  artifactAt,
+  blobsAt,
+  findUnitBuild,
+  HANDOFF_DIR,
+  type HandFile,
+  HOME_LOCATION_FIELD,
+  homeLocation,
+  inputName,
+  parseHandFile,
+  patchIdOf,
+  type Proposal,
+  renderHandFile,
+  RESULT_FILES_ROOT,
+  type RepoResult,
+  sameGitAddress,
+  soloUnitsProgress,
+  textFingerprint,
+  UNIT_BUILD_FIELD,
+  UNIT_PUSH_FIELD,
+  type UnitBuild,
+  unitBuildOf,
+  unitLikelyRepos,
+  unitMergeVerdict,
+  unitOutputsHomeReads,
+  type UnitResult,
+  unitsInPlanOrder,
+  workspaceHomeLocation,
+  writesByRepo,
+} from "./aidlc-unit-teams.js";
+import { repoNotThereLine } from "./aidlc-workspace-manifest.js";
+import { loadGraph } from "./aidlc-graph.ts";
+import {
+  captureStageValidationBasis,
+  latestCompletionBasesFromAudit,
+  sharedInputAmendedFields,
+  stageLabel,
+} from "./aidlc-validity.ts";
 import {
   parseTestingContract,
   PLAN_APPROVAL_CHECKPOINT,
@@ -102,7 +165,8 @@ function git(projectDir: string, args: string[], env?: NodeJS.ProcessEnv): GitRe
   const result = spawnSync("git", args, {
     cwd: projectDir,
     encoding: "utf-8",
-    env: { ...process.env, ...env },
+    env: { ...process.env, ...quietGit, ...env },
+    ...(quietGit === null ? {} : { timeout: QUIET_GIT_TIMEOUT_MS }),
   });
   return {
     ok: result.status === 0,
@@ -145,6 +209,28 @@ export interface UnitClaimPayload {
   audit_shard?: string;
   candidate_tree_oid?: string;
   candidate_head_oid?: string;
+  // Held for this team by the lead at the home, before anyone took it.
+  assigned?: true;
+  // Who took it: their git user.name.
+  taken_by?: string;
+  // What the team pushed, what the home found merged, and done: a Unit whose
+  // every repo merged, recorded at the home.
+  result?: UnitResult;
+  verdicts?: Array<{ repo: string; merged: boolean; commit?: string; how?: string }>;
+  done?: true;
+  turned_down?: { repo: string; words: string; at: string };
+  // Handed off by file; the team's progress file, when it sent one.
+  by_file?: true;
+  progress?: { stage: string; at: string };
+  // Started early on these Units' pushed heads.
+  early_on?: Array<{ unit: string; repos: Array<{ repo: string; branch: string; head: string }> }>;
+  // Changes the team proposed to an input, and the home's approved ones.
+  proposals?: Proposal[];
+  amendments?: Amendment[];
+  // The lead's sign-off of the result, when Lead Sign-off is on.
+  signoff?: { words: string; at: string };
+  // The lead's word that a repo merged the Unit where the check cannot see it.
+  said_merged?: Array<{ repo: string; words: string; at: string }>;
 }
 
 export interface UnitClaimView {
@@ -203,8 +289,8 @@ const INTEGRATION_BRANCH_BEFORE_WORDS = new RegExp(
 // branch is refused with its file, never skipped for a broader layer's choice.
 function affirmedIntegrationBranch(
   projectDir: string,
+  space = activeSpace(projectDir),
 ): { branch: string; source: string } | null {
-  const space = activeSpace(projectDir);
   for (const name of ["project.md", "team.md", "org.md"]) {
     const source = `aidlc/spaces/${space}/memory/${name}`;
     let body: string;
@@ -452,6 +538,8 @@ function createClaimCommit(
   payload: UnitClaimPayload,
   sourceTreeOid?: string,
   additionalParentOid?: string,
+  // More files for the commit's tree, by path: a Unit result's outputs.
+  files: Record<string, string> = {},
 ): string {
   const scratch = mkdtempSync(join(tmpdir(), "aidlc-unit-claim-"));
   const index = join(scratch, "index");
@@ -475,6 +563,12 @@ function createClaimCommit(
       env,
     );
     if (!update.ok) fail(`git update-index failed: ${update.stderr.trim()}`);
+    for (const [path, text] of Object.entries(files)) {
+      const fileBlob = spawnSync("git", ["hash-object", "-w", "--stdin"], { cwd: projectDir, encoding: "utf-8", input: text });
+      if (fileBlob.status !== 0) fail(`git hash-object failed: ${(fileBlob.stderr ?? "").trim()}`);
+      const added = git(projectDir, ["update-index", "--add", "--cacheinfo", `100644,${(fileBlob.stdout ?? "").trim()},${path}`], env);
+      if (!added.ok) fail(`git update-index failed: ${added.stderr.trim()}`);
+    }
     const tree = git(projectDir, ["write-tree"], env);
     if (!tree.ok) fail(`git write-tree failed: ${tree.stderr.trim()}`);
     // commit-tree does not read commit.gpgsign on its own; porcelain commits do.
@@ -643,7 +737,7 @@ function localOpeningStatus(projectDir: string): OpeningStatus {
 // board. The walking skeleton is the first DAG Unit, built on main; while it is
 // on, every Unit waits until its Unit Progress row is complete, the same
 // evidence a dependency is read from.
-function openingStatusFrom(state: string, dependencyBody: string): OpeningStatus {
+export function openingStatusFrom(state: string, dependencyBody: string): OpeningStatus {
   if (!isTeamUnitOwnership(state)) fail("Unit claims require Unit Ownership: team.");
   const parsed = parseBoltDag(dependencyBody);
   if (!parsed.ok) fail(`Cannot resolve Unit dependencies: ${parsed.reason}: ${parsed.detail}`);
@@ -796,6 +890,8 @@ function cachedClaimsForIdentity(
     "--format=%(objectname) %(refname)",
     "refs/heads/claim/",
     "refs/remotes/",
+    // Another workspace's copy of a home's claims (aidlc-unit take).
+    `refs/aidlc/home/${identity.intentId8}/`,
   ]);
   if (!refs.ok) return claims;
   for (const line of refs.stdout.split(/\r?\n/).filter(Boolean)) {
@@ -803,6 +899,7 @@ function cachedClaimsForIdentity(
     if (!oid || !ref) continue;
     if (
       !ref.startsWith(`refs/heads/claim/${identity.intentId8}/`) &&
+      !ref.startsWith(`refs/aidlc/home/${identity.intentId8}/claim/`) &&
       !new RegExp(
         `^refs/remotes/[^/]+/claim/${identity.intentId8.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}/`,
       ).test(ref)
@@ -817,6 +914,11 @@ function cachedClaimsForIdentity(
       );
     }
     const prior = claims.get(payload.unit);
+    // The same commit the cache names: its full payload, not the cache's stub.
+    if (prior?.oid === oid) {
+      prior.payload = payload;
+      continue;
+    }
     if (
       prior &&
       (prior.generation > payload.generation ||
@@ -3651,6 +3753,1570 @@ function clearUnitOwner(projectDir: string, unit: string): void {
   });
 }
 
+// Who builds which Unit, in the lead's own words at the home: one claim per
+// Unit they named, held for that team by the claim's compare-and-swap, with no
+// scope stamp, so the lead's checkout stays the home's. A Unit they left out
+// stays open. The walking skeleton, when on, is built here first.
+function assignUnits(args: string[], projectDir?: string): void {
+  const { positional, flags, bareFlags } = parseArgs(args);
+  const pd = resolveProjectDir(projectDir);
+  const state = readStateFile(pd);
+  if (!isTeamUnitOwnership(state) || homeLocation(state) === null) {
+    fail("Units are given to teams once teams are chosen for this work.");
+  }
+  if (readApplicableTeamUnitScopeStamp(pd)) fail("Units are given to teams at the home, not from a checkout scoped to one Unit.");
+  const words = flags["person-words-file"] !== undefined
+    ? readAnswerTextFile(pd, flags["person-words-file"])
+    : flags["person-words"] ?? "";
+  const open = bareFlags.has("open") || flags.open !== undefined;
+  const pairs: Array<{ unit: string; team: string }> = [];
+  for (const token of positional) {
+    const at = token.indexOf("=");
+    const unit = at > 0 ? token.slice(0, at).trim() : "";
+    const team = at > 0 ? token.slice(at + 1).trim() : "";
+    if (!unit || !team) fail(`"${token}" is not <unit>=<team>.`);
+    const unitError = validateUnitName(unit);
+    if (unitError) fail(unitError);
+    if (/[\r\n|]/.test(team)) fail("Team labels cannot contain pipes or newlines.");
+    pairs.push({ unit, team });
+  }
+  if (pairs.length === 0 && !open) fail("Usage: aidlc-unit assign <unit>=<team> [<unit>=<team> ...] | --open");
+  const local = localOpeningStatus(pd);
+  const skeleton = teamSkeletonOn(state) ? local.skeleton : null;
+  const lines: string[] = [];
+  const named = new Map<string, string>();
+  for (const { unit, team } of pairs) {
+    if (!local.units.includes(unit)) fail(`${unit} is not one of this work's Units (${local.units.join(", ")}).`);
+    const already = named.get(unit);
+    if (already !== undefined && already !== team) fail(`${unit} can go to one team; you named ${already} and ${team}.`);
+    named.set(unit, team);
+  }
+  if (skeleton !== null && named.has(skeleton)) {
+    lines.push(`${skeleton} is the walking skeleton, built here before the teams take their Units.`);
+    named.delete(skeleton);
+  }
+  const identity = activeIdentity(pd);
+  const integration = fetchIntegration(pd);
+  const assigned: Array<{ unit: string; team: string }> = [];
+  const held = new Set<string>();
+  for (const [unit, team] of named) {
+    validateClaimRefUnit(identity.intentId8, unit);
+    const ref = claimRef(identity.intentId8, unit);
+    const current = currentClaim(pd, integration.remote, ref);
+    if (current?.status === "claimed") {
+      held.add(unit);
+      if (current.owner === team) assigned.push({ unit, team });
+      else lines.push(`${unit} is held by ${current.owner}, so it stays with them.`);
+      continue;
+    }
+    const payload: UnitClaimPayload = {
+      version: 1,
+      status: "claimed",
+      owner: team,
+      space: identity.space,
+      intent_uuid: identity.intentUuid,
+      intent_id8: identity.intentId8,
+      unit,
+      generation: current?.status === "released" ? current.generation : (current?.generation ?? 0) + 1,
+      nonce: randomUUID(),
+      base_oid: integration.oid,
+      integration_ref: integration.ref,
+      claim_ref: ref,
+      predecessor_oid: current?.oid ?? null,
+      gate_rhythm: readUnitGateRhythm(state),
+      assigned: true,
+    };
+    const commit = createClaimCommit(pd, current?.oid ?? integration.oid, payload);
+    const pushed = updateClaimRef(pd, integration.remote, ref, commit, current?.oid ?? null);
+    if (!pushed.ok) {
+      const winner = currentClaim(pd, integration.remote, ref);
+      if (winner?.status === "claimed") held.add(unit);
+      lines.push(
+        winner?.status === "claimed"
+          ? `${unit} is held by ${winner.owner}, so it stays with them.`
+          : `${unit} could not be held for ${team}: ${pushed.refused ?? "the claim did not take"}. It stays open.`,
+      );
+      continue;
+    }
+    invalidateLiveClaimPayloadCache(pd, unit);
+    held.add(unit);
+    assigned.push({ unit, team });
+  }
+  // Open: no team holds it, whether named now, earlier, or never.
+  const openUnits = unitsInPlanOrder(pd, local.units).filter((unit) =>
+    unit !== skeleton && !held.has(unit) &&
+    (named.has(unit) || currentClaim(pd, integration.remote, claimRef(identity.intentId8, unit))?.status !== "claimed"));
+  appendAuditEntry("UNITS_ASSIGNED", {
+    Assigned: assigned.map((row) => `${row.unit}=${row.team}`).join(", ") || "none",
+    Open: openUnits.join(", ") || "none",
+    ...(words.trim() ? { "Person Words": words.trim() } : {}),
+  }, pd);
+  const sentence = (unit: string): string => unit.charAt(0).toUpperCase() + unit.slice(1);
+  const summary = [
+    ...assigned.map((row) => `${sentence(row.unit)}: ${row.team}.`),
+    ...(openUnits.length > 0 ? [`Open for any team: ${openUnits.join(", ")}.`] : []),
+  ];
+  const rhythm = readUnitGateRhythm(state) === "unit-end"
+    ? "Each team approves its Unit once, at the end."
+    : "Each team approves its Unit after every stage; to approve once at the end of each Unit, say so before the first Unit is built.";
+  console.log(JSON.stringify({
+    assigned,
+    open: openUnits,
+    notice: [...summary, ...lines, rhythm].join(" "),
+  }));
+}
+
+// --- Taking a Unit: a team builds it as a piece of work of its own -----------
+//
+// The home is the work where Inception ran. Its claims live at its remote:
+// this workspace's own when it is the home's workspace, else the address the
+// home recorded, fetched into AI-DLC's own refs so no remote is added.
+
+interface HomeWork {
+  space: string;
+  dirName: string;
+  state: string;
+  uuid: string;
+  id8: string;
+  label: string;
+  location: string;
+  // A remote name, a git address, or null for this repo's own refs.
+  target: string | null;
+  // Where the home's record is in its repo, with forward slashes.
+  recordPrefix: string;
+  // The repos the home's work records.
+  repos: string[];
+  // Solo work, one Unit at a time, built from another machine.
+  solo: boolean;
+}
+
+function findHomeWork(projectDir: string, dirName: string, space: string): HomeWork {
+  let state: string;
+  try {
+    state = readStateFile(projectDir, dirName, space);
+  } catch {
+    fail(`No work named ${dirName} in space ${space} here.`);
+  }
+  // Solo work built one Unit at a time from another machine: its home is this
+  // workspace's origin, and its state is never written from here.
+  const solo = !isTeamUnitOwnership(state) && getField(state, "Construction Iteration")?.trim() === "unit-major";
+  const workspaceOrigin = workspaceHomeLocation(projectDir);
+  const location = solo ? (workspaceOrigin === "local" ? null : workspaceOrigin) : homeLocation(state);
+  if ((!solo && !isTeamUnitOwnership(state)) || location === null) fail(`${dirName} is not work that teams build.`);
+  const row = readIntentRegistry(projectDir, space).find((entry) => entry.dirName === dirName);
+  if (!row?.uuid) fail(`${dirName} has no entry in its space's list of work.`);
+  const own = workspaceHomeLocation(projectDir);
+  const target = location === "local" || (own !== null && sameGitAddress(location, own))
+    ? repositoryRemote(projectDir)
+    : location;
+  return {
+    space,
+    dirName,
+    state,
+    uuid: row.uuid,
+    id8: idSuffix(row.uuid),
+    label: row.slug,
+    location,
+    target,
+    recordPrefix: `aidlc/spaces/${space}/intents/${dirName}`,
+    repos: row.repos ?? [],
+    solo,
+  };
+}
+
+// The home's integration branch, fetched with the person's own login: through
+// this workspace's remote, or by the home's address into AI-DLC's own ref.
+function fetchHomeIntegration(
+  projectDir: string,
+  home: HomeWork,
+  claim: UnitClaimView | null,
+): { ref: string; branch: string; oid: string } {
+  if (home.target === null || !isGitAddress(home.target)) {
+    const remote = home.target;
+    const affirmed = affirmedIntegrationBranch(projectDir, home.space);
+    const branch = affirmed?.branch ?? integrationBranch(projectDir, remote);
+    if (remote) {
+      const fetched = git(projectDir, ["fetch", remote, branch]);
+      if (!fetched.ok) fail(`The home's branch ${branch} could not be fetched from ${remote}: ${fetched.stderr.trim()}`);
+    }
+    const ref = remote ? `refs/remotes/${remote}/${branch}` : `refs/heads/${branch}`;
+    return { ref, branch, oid: gitOutput(projectDir, ["rev-parse", "--verify", ref], `The home's branch ${branch} is not here`) };
+  }
+  const fromClaim = claim?.payload.integration_ref.match(/^refs\/(?:remotes\/[^/]+|heads)\/(.+)$/)?.[1];
+  let branch = fromClaim;
+  if (!branch) {
+    const advertised = git(projectDir, ["ls-remote", "--symref", home.target, "HEAD"]);
+    if (!advertised.ok) fail(`The home at ${home.location} could not be reached: ${advertised.stderr.trim()}`);
+    branch = advertised.stdout.match(/^ref:\s+refs\/heads\/([^\s]+)\s+HEAD$/m)?.[1] ?? "main";
+  }
+  const ref = `refs/aidlc/home/${home.id8}/integration`;
+  const fetched = git(projectDir, ["fetch", "--no-tags", home.target, `+refs/heads/${branch}:${ref}`]);
+  if (!fetched.ok) fail(`The home at ${home.location} could not be fetched: ${fetched.stderr.trim()}`);
+  return { ref, branch, oid: gitOutput(projectDir, ["rev-parse", "--verify", ref], "The home's branch is not here") };
+}
+
+function isGitAddress(target: string): boolean {
+  return /[:/\\]/.test(target);
+}
+
+// What the home's plan says at a commit: its state and Unit plan, read from
+// git, or a line that the lead has not pushed it yet.
+function homePlanAt(projectDir: string, home: HomeWork, oid: string, branch: string): { state: string; dependencies: string } {
+  const read = (rel: string): string => {
+    const shown = git(projectDir, ["show", `${oid}:${home.recordPrefix}/${rel}`, "--"]);
+    if (!shown.ok) {
+      fail(`The home's work is not on its branch ${branch} yet, so there is nothing to take: the lead pushes it first.`);
+    }
+    return shown.stdout;
+  };
+  return { state: read("aidlc-state.md"), dependencies: read("inception/units-generation/unit-of-work-dependency.md") };
+}
+
+// The Inception outputs a Unit's planned stages read: the copy its build starts
+// from, at the paths those stages read them, plus the Unit plan itself.
+function homeInputPaths(stages: string[]): string[] {
+  const graph = loadStageGraphAll();
+  const paths = new Set<string>(["inception/units-generation/unit-of-work-dependency.md"]);
+  for (const slug of stages) {
+    const stage = graph.find((entry) => entry.slug === slug);
+    for (const consume of stage?.consumes ?? []) {
+      const producer = graph.find((entry) =>
+        (entry.phase === "ideation" || entry.phase === "inception") &&
+        [...(entry.produces ?? []), ...(entry.optional_produces ?? [])].includes(consume.artifact)
+      );
+      if (producer && producer.slug !== "reverse-engineering") {
+        paths.add(`${producer.phase}/${producer.slug}/${artifactFilename(consume.artifact)}`);
+      }
+    }
+  }
+  return [...paths].sort();
+}
+
+// The home's approvals of the stages that produced the copy, as data: when
+// each was approved at the home. Never this build's own approval.
+function homeApprovals(projectDir: string, home: HomeWork, oid: string, slugs: Set<string>): string[] {
+  const listed = git(projectDir, ["ls-tree", "--name-only", `${oid}:${home.recordPrefix}/audit`]);
+  if (!listed.ok) return [];
+  const approvals = new Map<string, string>();
+  for (const shard of listed.stdout.split(/\r?\n/).filter((name) => name.endsWith(".md"))) {
+    const text = git(projectDir, ["show", `${oid}:${home.recordPrefix}/audit/${shard}`, "--"]);
+    if (!text.ok) continue;
+    for (const block of text.stdout.replace(/\r\n/g, "\n").split(/\n---\n/)) {
+      if (auditBlockField(block, "Event") !== "GATE_APPROVED") continue;
+      const stage = auditBlockField(block, "Stage");
+      if (stage && slugs.has(stage)) approvals.set(stage, auditBlockField(block, "Timestamp") ?? "");
+    }
+  }
+  return [...approvals].sort(([a], [b]) => a.localeCompare(b)).map(([stage, when]) => `${stage} approved at the home ${when}`.trim());
+}
+
+// Another AI-DLC tool, run as this install runs its tools.
+function runEngineUtility(projectDir: string, args: string[]): GitResult {
+  const command = isCompiledExecutable()
+    ? [process.execPath, "engine", ...args]
+    : [process.execPath, fileURLToPath(new URL("./aidlc-utility.ts", import.meta.url)), ...args];
+  const result = spawnSync(command[0], [...command.slice(1), "--project-dir", projectDir], {
+    encoding: "utf-8",
+    env: process.env,
+  });
+  return { ok: result.status === 0, stdout: result.stdout ?? "", stderr: result.stderr ?? "", code: result.status ?? 1 };
+}
+
+// The Unit's build: a piece of work of its own in the team's space, running the
+// home's planned per-Unit stages from a copy of what the Unit was approved with.
+// What a build needs to know of its home, whether it read the home by git or
+// from a hand-off file.
+type HomeRef = Pick<HomeWork, "location" | "uuid" | "space" | "dirName" | "label">;
+
+// Where a build's copy comes from: the home's commit, or a hand-off file.
+interface BuildSource {
+  read: (rel: string) => string | null;
+  approvals: (produced: Set<string>) => string[];
+}
+
+function createUnitBuild(
+  projectDir: string,
+  home: HomeRef,
+  plan: { state: string },
+  baseOid: string,
+  unit: string,
+  team: string,
+  attempt: number,
+  source: BuildSource,
+  // A build taken from solo work lives in the home's own space.
+  inSpace?: string,
+): { space: string; dirName: string } {
+  const space = inSpace ?? slugify(team);
+  if (!listSpacesHere(projectDir).includes(space)) {
+    const created = runEngineUtility(projectDir, isCompiledExecutable() ? ["space", "create", space] : ["space-create", space]);
+    if (!created.ok) fail(`The ${team} team's space could not be made: ${(created.stderr || created.stdout).trim()}`);
+  }
+  const scope = getField(plan.state, "Scope") ?? "";
+  const grid = loadScopeMapping()[scope];
+  if (!grid) fail(`The home's plan names a scope this install does not have: ${scope}.`);
+  const stages = unitMajorConstructionStageSlugs(scope, plan.state, true);
+  const wanted = new Set(stages);
+  const graph = loadStageGraphAll();
+  const skip = graph
+    .filter((stage) => stage.phase !== "initialization" && grid.stages[stage.slug] === "EXECUTE" && !wanted.has(stage.slug))
+    .map((stage) => stage.slug);
+  const add = stages.filter((slug) => grid.stages[slug] !== "EXECUTE");
+  const created = runEngineUtility(projectDir, [
+    ...(isCompiledExecutable() ? ["intent", "create"] : ["intent-create"]),
+    "--scope", scope,
+    "--label", unit,
+    "--arguments", `Build ${unit} for ${home.label}, from what the home approved`,
+    "--space", space,
+    ...(skip.length > 0 ? ["--skip", skip.join(",")] : []),
+    ...(add.length > 0 ? ["--add", add.join(",")] : []),
+    "--keep-entry-in-record",
+  ]);
+  if (!created.ok) fail(`${unit}'s build could not be started: ${(created.stderr || created.stdout).trim()}`);
+  const dirName = readActiveIntentCursor(projectDir, space);
+  if (dirName === null) fail(`${unit}'s build was started but could not be found in space ${space}.`);
+  const record = join(intentsDir(projectDir, space), dirName);
+  // The copy, at the paths the Unit's stages read it.
+  const inputs: Array<{ path: string; fingerprint: string }> = [];
+  for (const rel of homeInputPaths(stages)) {
+    const text = source.read(rel);
+    if (text === null) continue;
+    mkdirSync(dirname(join(record, ...rel.split("/"))), { recursive: true });
+    writeFileSync(join(record, ...rel.split("/")), text, "utf-8");
+    inputs.push({ path: rel, fingerprint: textFingerprint(text) });
+  }
+  const produced = new Set(inputs.map((input) => input.path.split("/")[1]));
+  const approvals = source.approvals(produced);
+  const fingerprint = textFingerprint(inputs.map((input) => `${input.path} ${input.fingerprint}`).join("\n"));
+  writeFileSync(join(record, APPROVED_INPUTS_FILE), approvedInputsText(unit, home, baseOid, inputs, approvals), "utf-8");
+  // Done at the home: the stages before Construction show as done, and are not
+  // this build's plan.
+  const homeBoxes = new Map(parseCheckboxes(plan.state).map((box) => [box.slug, box.state]));
+  withAuditLock(projectDir, () => {
+    let content = readStateFile(projectDir, dirName, space);
+    for (const stage of graph.filter((entry) => entry.phase === "ideation" || entry.phase === "inception")) {
+      if (homeBoxes.get(stage.slug) !== "completed") continue;
+      content = content.replace(new RegExp(`^- \\[[ xSR?-]\\] ${stage.slug}(\\s)`, "m"), `- [x] ${stage.slug}$1`);
+    }
+    const rhythm = readUnitGateRhythm(plan.state);
+    for (const [field, value] of [
+      ["Construction Iteration", rhythm === "unit-end" ? "unit-major" : "stage-major"],
+      ["Construction Execution", "serial"],
+      ["Construction Checkpoints", rhythm === "unit-end" ? "enabled" : "disabled"],
+      ["Skeleton Stance", "off"],
+      [UNIT_BUILD_FIELD, unit],
+      [HOME_LOCATION_FIELD, home.location],
+      ["Home Work", home.uuid],
+      ["Home Record", `${home.space}/${home.dirName}`],
+      ["Home Label", home.label],
+      ["Home Attempt", String(attempt)],
+    ] as const) {
+      content = setRuntimeField(content, field, value);
+    }
+    // The type the home settled; a later scan here does not ask about it again.
+    const homeType = getField(plan.state, "Project Type")?.trim();
+    if (homeType) {
+      content = content.replace(/^- \*\*Project Type Source\*\*:.*\n/m, "")
+        .replace(/^(- \*\*Project Type\*\*:).*$/m, `$1 ${homeType}\n- **Project Type Source**: the home`);
+    }
+    writeStateFile(projectDir, content, dirName, space);
+    appendAuditEntry("UNIT_TAKEN_IN", {
+      "Home Location": home.location,
+      "Home Work": home.uuid,
+      "Home Record": `${home.space}/${home.dirName}`,
+      Unit: unit,
+      Team: team,
+      "Home Attempt": String(attempt),
+      "Home Commit": baseOid,
+      "Copy Fingerprint": fingerprint,
+      "Home Approvals": approvals.join("; ") || "none recorded",
+    }, projectDir, dirName, space);
+  });
+  return { space, dirName };
+}
+
+export const APPROVED_INPUTS_FILE = "approved-inputs.md";
+
+function approvedInputsText(
+  unit: string,
+  home: HomeRef,
+  baseOid: string,
+  inputs: Array<{ path: string; fingerprint: string }>,
+  approvals: string[],
+): string {
+  return [
+    "# What this Unit was approved with",
+    "",
+    `${unit} of ${home.label}, from the home at ${home.location} (space ${home.space}), copied from its commit ` +
+      `${baseOid.slice(0, 12)}. These files are the home's: approved there, read here. Change one and AI-DLC ` +
+      "offers your change to the home.",
+    "",
+    "| File | Fingerprint |",
+    "| --- | --- |",
+    ...inputs.map((input) => `| ${input.path} | ${input.fingerprint} |`),
+    "",
+    "## Approved at the home",
+    "",
+    ...(approvals.length > 0 ? approvals.map((line) => `- ${line}`) : ["- none recorded"]),
+    "",
+  ].join("\n");
+}
+
+function setRuntimeField(content: string, field: string, value: string): string {
+  const line = new RegExp(`^- \\*\\*${field}\\*\\*:.*$`, "m");
+  if (line.test(content)) return content.replace(line, `- **${field}**: ${value}`);
+  return content.replace(/^## Runtime State\s*$/m, (heading) => `${heading}\n- **${field}**: ${value}`);
+}
+
+function listSpacesHere(projectDir: string): string[] {
+  try {
+    return readdirSync(join(projectDir, "aidlc", "spaces")).filter((name) =>
+      existsSync(join(projectDir, "aidlc", "spaces", name, "memory"))
+    );
+  } catch {
+    return [];
+  }
+}
+
+// The Units of solo work built from another machine: the Unit plan at the
+// home's commit, with what its walk started and finished read from the record
+// here (git brought it with the pull).
+function soloOpening(projectDir: string, home: HomeWork, plan: { state: string; dependencies: string }): OpeningStatus & { started: Set<string> } {
+  const parsed = parseBoltDag(plan.dependencies);
+  if (!parsed.ok) fail(`Cannot resolve Unit dependencies: ${parsed.reason}: ${parsed.detail}`);
+  const scope = getField(plan.state, "Scope") ?? "";
+  const finalStage = unitMajorConstructionStageSlugs(scope, plan.state, true).at(-1) ?? "code-generation";
+  const progress = soloUnitsProgress(readAuditShardEvents(projectDir, home.dirName, home.space), finalStage);
+  const blockers = new Map(parsed.units.map((edge) => [edge.name, edge.depends_on.filter((dep) => !progress.done.has(dep))]));
+  return { units: parsed.units.map((edge) => edge.name), blockers, completed: progress.done, skeleton: parsed.batches[0][0], started: progress.started };
+}
+
+// Take a Unit of the home's work: hold it at the home (adopting the lead's
+// claim for this team, or claiming an open Unit), then start its build in the
+// team's space. A Unit held by another team stays theirs; a Unit that waits on
+// another is not taken yet.
+function takeUnit(args: string[], projectDir?: string): void {
+  const { positional, flags, bareFlags } = parseArgs(args);
+  if (flags.file !== undefined) {
+    takeFromFile(resolveProjectDir(projectDir), flags.file);
+    return;
+  }
+  const unit = positional[0];
+  if (!unit) fail("Usage: aidlc-unit take <unit> --home <record> [--home-space <space>] [--team <label>]");
+  const unitError = validateUnitName(unit);
+  if (unitError) fail(unitError);
+  if (!flags.home) fail("take needs --home <record>: the home's work this Unit belongs to.");
+  const pd = resolveProjectDir(projectDir);
+  const home = findHomeWork(pd, flags.home, flags["home-space"] ?? DEFAULT_SPACE);
+  validateClaimRefUnit(home.id8, unit);
+  // Taken here before (this clone or another of this workspace): carry it on.
+  const existing = findUnitBuild(pd, home.uuid, unit);
+  if (existing !== null) {
+    setActiveSpaceCursor(pd, existing.space);
+    selectIntentForSession(pd, existing.dirName, existing.space);
+    console.log(JSON.stringify({
+      taken: true,
+      resumed: true,
+      unit,
+      space: existing.space,
+      record: existing.dirName,
+      notice: `Carrying on ${unit}, the ${existing.space} team's build here.`,
+    }));
+    return;
+  }
+  const ref = claimRef(home.id8, unit);
+  if (home.target !== null) ensureFetchedClaim(pd, home, ref);
+  const current = currentClaim(pd, home.target, ref);
+  const integration = fetchHomeIntegration(pd, home, current);
+  const plan = homePlanAt(pd, home, integration.oid, integration.branch);
+  const solo = home.solo ? soloOpening(pd, home, plan) : null;
+  const opening = solo ?? openingStatusFrom(plan.state, plan.dependencies);
+  if (!opening.units.includes(unit)) fail(`${unit} is not one of ${home.label}'s Units (${opening.units.join(", ")}).`);
+  if (solo?.started.has(unit)) fail(`${unit} is being built on the other machine; take another Unit, or follow along.`);
+  const openUnits = opening.units.filter((name) => name !== unit && !opening.completed.has(name));
+  const me = git(pd, ["config", "user.name"]).stdout.trim() || "a teammate";
+  const activeTeam = activeSpace(pd) === DEFAULT_SPACE ? null : activeSpace(pd);
+  if (current?.status === "claimed") {
+    if (current.payload.taken_by !== undefined) {
+      fail(`${unit} is held by the ${current.owner} team (${current.payload.taken_by} took it).`);
+    }
+    if (activeTeam !== null && flags.team === undefined && current.owner !== activeTeam) {
+      fail(`${unit} is held by the ${current.owner} team.${openUnits.length > 0 ? ` Open: ${openUnits.join(", ")}.` : ""}`);
+    }
+  }
+  if (opening.completed.has(unit)) fail(`${unit} is already done at the home.`);
+  // A Unit the home marked done on its claim counts as done, pushed state or not.
+  const depClaims = new Map<string, UnitClaimView | null>();
+  const blockers = (opening.blockers.get(unit) ?? []).filter((dep) => {
+    if (dep === "walking-skeleton") return true;
+    const depRef = claimRef(home.id8, dep);
+    if (home.target !== null) ensureFetchedClaim(pd, home, depRef);
+    depClaims.set(dep, currentClaim(pd, home.target, depRef));
+    return depClaims.get(dep)?.payload.done !== true;
+  });
+  // Starting early, on the branches its dependencies pushed (the person asked).
+  const pushedDeps = blockers.every((dep) => depClaims.get(dep)?.payload.result !== undefined);
+  const early = (bareFlags.has("early") || flags.early !== undefined) && blockers.length > 0 && pushedDeps;
+  if (blockers.length > 0 && !early) {
+    fail(
+      `${unit} waits on ${blockers.join(", ")}, which ${blockers.length === 1 ? "is" : "are"} not done at the home yet. ` +
+        `It opens once ${blockers.length === 1 ? "it is" : "they are"} done` +
+        (pushedDeps ? `, or starts early on ${blockers.length === 1 ? "its" : "their"} pushed branches if you ask.` : "."),
+    );
+  }
+  const earlyOn = early
+    ? blockers.map((dep) => ({
+      unit: dep,
+      repos: (depClaims.get(dep)?.payload.result?.repos ?? []).map((repo) => ({
+        repo: repo.repo,
+        branch: repo.branch,
+        head: repo.heads.at(-1) ?? "",
+      })),
+    }))
+    : undefined;
+  const team = current?.status === "claimed" ? current.owner : flags.team ?? activeTeam ?? me;
+  if (/[\r\n|]/.test(team)) fail("Team labels cannot contain pipes or newlines.");
+  const generation = current?.status === "claimed"
+    ? current.generation
+    : current?.status === "released" ? current.generation : (current?.generation ?? 0) + 1;
+  const payload: UnitClaimPayload = {
+    ...(current?.status === "claimed" ? current.payload : {
+      version: 1,
+      status: "claimed",
+      owner: team,
+      space: home.space,
+      intent_uuid: home.uuid,
+      intent_id8: home.id8,
+      unit,
+      nonce: randomUUID(),
+      claim_ref: ref,
+      gate_rhythm: readUnitGateRhythm(plan.state),
+    }),
+    generation,
+    base_oid: integration.oid,
+    integration_ref: integration.ref,
+    predecessor_oid: current?.oid ?? null,
+    taken_by: me,
+    ...(earlyOn ? { early_on: earlyOn } : {}),
+  } as UnitClaimPayload;
+  const commit = createClaimCommit(pd, current?.oid ?? integration.oid, payload);
+  const pushed = updateClaimRef(pd, home.target, ref, commit, current?.oid ?? null);
+  let resultByFile = false;
+  if (!pushed.ok) {
+    const winner = currentClaim(pd, home.target, ref);
+    if (winner?.status === "claimed" && winner.nonce !== current?.nonce) fail(`${unit} was just taken by the ${winner.owner} team.`);
+    if (winner?.status === "claimed" && winner.payload.taken_by !== undefined) fail(`${unit} was just taken by ${winner.payload.taken_by}.`);
+    if (current?.status !== "claimed") {
+      fail(
+        `${unit} is open at the home, which takes no push from here: ${pushed.refused ?? "the claim did not take"}. ` +
+          `Ask the lead to hold it for your team: at the home they run /aidlc unit assign ${unit}=${team}.`,
+      );
+    }
+    // The lead holds it for this team: it is theirs to take without a push,
+    // and its result goes back as a file.
+    resultByFile = true;
+  }
+  invalidateLiveClaimPayloadCache(pd, unit);
+  const build = createUnitBuild(pd, home, plan, integration.oid, unit, team, generation, {
+    read: (rel) => {
+      const shown = git(pd, ["show", `${integration.oid}:${home.recordPrefix}/${rel}`, "--"]);
+      return shown.ok ? shown.stdout : null;
+    },
+    approvals: (produced) => homeApprovals(pd, home, integration.oid, produced),
+  }, home.solo ? home.space : undefined);
+  setActiveSpaceCursor(pd, build.space);
+  // Early: the Unit's branch starts at each dependency's pushed head, checked
+  // out where nothing of the person's is uncommitted.
+  const earlyLines: string[] = [];
+  for (const dep of earlyOn ?? []) {
+    for (const repo of dep.repos) {
+      const dir = repo.repo === "." ? pd : repoDir(pd, repo.repo);
+      const remote = isGitRepoDir(dir) ? repositoryRemote(dir) : null;
+      if (remote === null || git(dir, ["rev-parse", "--verify", "--quiet", `refs/heads/${unit}`]).ok) continue;
+      git(dir, ["fetch", "-q", remote, `+refs/heads/${repo.branch}:refs/remotes/${remote}/${repo.branch}`]);
+      const start = `${remote}/${repo.branch}`;
+      const name = repo.repo === "." ? "the repo" : repo.repo;
+      const clean = git(dir, ["status", "--porcelain"]).stdout.trim() === "";
+      if (clean && git(dir, ["switch", "-q", "-c", unit, start]).ok) earlyLines.push(`You are on branch ${unit} in ${name} now.`);
+      else if (git(dir, ["branch", unit, start]).ok) {
+        earlyLines.push(`Branch ${unit} in ${name} starts there; your uncommitted changes kept you on your branch, so switch when you are ready.`);
+      }
+    }
+  }
+  if (earlyOn) {
+    const names = [...new Set(earlyOn.flatMap((dep) => dep.repos.map((repo) => (repo.repo === "." ? "the repo" : repo.repo))))];
+    earlyLines.unshift(
+      `It starts early on the pushed branch of ${joinNames(earlyOn.map((dep) => dep.unit))} in ${joinNames(names)}. ` +
+        "It may still change before it merges.",
+    );
+  }
+  // The likely repos this workspace has no checkout of, said with the way to one.
+  const likely = unitLikelyRepos(pd, home.dirName, home.space).get(unit) ?? [];
+  const missing = [...new Set(likely.map((repo) => repo.split("/")[0]))]
+    .filter((repo) => home.repos.includes(repo) && !isGitRepoDir(repoDir(pd, repo)));
+  if (resultByFile) {
+    withAuditLock(pd, () => {
+      const content = readStateFile(pd, build.dirName, build.space);
+      writeStateFile(pd, setRuntimeField(content, "Home Result", "by file"), build.dirName, build.space);
+    });
+  }
+  console.log(JSON.stringify({
+    taken: true,
+    unit,
+    team,
+    space: build.space,
+    record: build.dirName,
+    notice: `${unit.charAt(0).toUpperCase()}${unit.slice(1)} is yours, for the ${team} team. Its build is its own ` +
+      `piece of work here, under your team's rules, from what the home approved.` +
+      (resultByFile
+        ? ` You can read the home but not write to it, so the result of ${unit} goes back as a file when it is built.`
+        : "") +
+      earlyLines.map((line) => ` ${line}`).join("") +
+      missing.map((repo) => ` ${repoNotThereLine(pd, repo)}`).join(""),
+  }));
+}
+
+// Git that talks to a remote nobody typed a command for (the claims fetch, the
+// merge check's reads and its write of the verdict): it never asks for a
+// password, a passphrase or a sign-in (git, Git Credential Manager and ssh are
+// each told not to, for these calls only; the person's config is left as it
+// is) and gives up after a short while, so a step never hangs on it.
+const QUIET_GIT_TIMEOUT_MS = 15_000;
+let quietGit: NodeJS.ProcessEnv | null = null;
+
+function quietly<T>(dir: string, work: () => T): T {
+  if (quietGit !== null) return work();
+  const ssh = process.env.GIT_SSH_COMMAND || git(dir, ["config", "--get", "core.sshCommand"]).stdout.trim() || "ssh";
+  quietGit = {
+    GIT_TERMINAL_PROMPT: "0",
+    GCM_INTERACTIVE: "never",
+    // GIT_SSH alone names the person's own ssh program (plink, say): left as it is.
+    ...(process.env.GIT_SSH && !process.env.GIT_SSH_COMMAND ? {} : { GIT_SSH_COMMAND: `${ssh} -o BatchMode=yes` }),
+  };
+  try {
+    return work();
+  } finally {
+    quietGit = null;
+  }
+}
+
+function quietFetch(dir: string, args: string[]): GitResult {
+  return quietly(dir, () => git(dir, ["fetch", ...args]));
+}
+
+// The work's claims as the home has them now, fetched into the refs the
+// person's own fetch uses (through this workspace's remote, or by the home's
+// address into AI-DLC's own refs), so nobody has to fetch to see what the other
+// side sent. Once per chat, and at every step that shows or acts on the
+// claims (`now`). `unreached` is the remote or address that could not be
+// reached: the last fetch stands.
+const CLAIMS_FETCHED_FILE = "claims-fetched.json";
+
+export function refreshHomeClaims(
+  projectDir: string,
+  options: { home?: { target: string | null; id8: string }; sessionId?: string; now?: boolean } = {},
+): { fetched: boolean; unreached: string | null } {
+  const pd = resolveProjectDir(projectDir);
+  const { target, id8 } = options.home ?? { target: repositoryRemote(pd), id8: activeIdentity(pd).intentId8 };
+  if (target === null) return { fetched: false, unreached: null };
+  const mark = join(sessionsDir(pd), CLAIMS_FETCHED_FILE);
+  let chats: Record<string, string> = {};
+  try {
+    chats = JSON.parse(readFileSync(mark, "utf-8")) as Record<string, string>;
+  } catch {
+    // No fetch noted yet.
+  }
+  const chat = options.sessionId ?? "no chat";
+  if (!options.now && chats[id8] === chat) return { fetched: false, unreached: null };
+  const into = isGitAddress(target) ? `refs/aidlc/home/${id8}/claim/${id8}` : `refs/remotes/${target}/claim/${id8}`;
+  const ok = quietFetch(pd, ["--no-tags", "--no-filter", "-q", target, `+refs/heads/claim/${id8}/*:${into}/*`]).ok;
+  try {
+    mkdirSync(dirname(mark), { recursive: true });
+    writeFileAtomic(mark, `${JSON.stringify({ ...chats, [id8]: chat })}\n`);
+  } catch {
+    // Unnoted, the next step fetches again.
+  }
+  return { fetched: ok, unreached: ok ? null : target };
+}
+
+// A claim at the home's address: fetched so its payload can be read.
+function ensureFetchedClaim(projectDir: string, home: HomeWork, ref: string): void {
+  if (home.target === null || !isGitAddress(home.target)) return;
+  git(projectDir, ["fetch", "--no-tags", home.target, `+${ref}:refs/aidlc/home/${home.id8}/${ref.slice("refs/heads/".length)}`]);
+}
+
+// --- Sending a Unit's build home ----------------------------------------------
+//
+// The push the person asks for: in each repo the Unit changed, a commit of
+// exactly the paths its Code Generation recorded writing, on the Unit's branch,
+// pushed to that repo's own remote with their login, identity, signing and
+// hooks (no force, no --no-verify); then the result on the claim at the home.
+// Their other uncommitted work is never committed or touched. When the Unit's
+// branch is not the one they are on, it is switched to (their work comes along
+// as it is) and the line says which branch they are on.
+
+function buildsHome(projectDir: string, build: UnitBuild): HomeWork {
+  const at = build.homeRecord.indexOf("/");
+  return findHomeWork(projectDir, build.homeRecord.slice(at + 1), build.homeRecord.slice(0, at));
+}
+
+// A code repo's integration branch: where its remote's HEAD points.
+function repoIntegration(dir: string, remote: string): string {
+  const head = git(dir, ["symbolic-ref", "--quiet", "--short", `refs/remotes/${remote}/HEAD`]).stdout.trim();
+  if (head) return head;
+  for (const name of ["main", "master"]) {
+    if (git(dir, ["rev-parse", "--verify", "--quiet", `refs/remotes/${remote}/${name}`]).ok) return `${remote}/${name}`;
+  }
+  return `${remote}/main`;
+}
+
+function pushUnit(args: string[], projectDir?: string): void {
+  const { bareFlags, flags } = parseArgs(args);
+  const pd = resolveProjectDir(projectDir);
+  const state = readStateFile(pd);
+  const build = unitBuildOf(state);
+  if (build === null) fail("push sends a Unit's build home; this work is not one.");
+  const unit = build.unit;
+  if (bareFlags.has("later") || flags.later !== undefined) {
+    withAuditLock(pd, () => writeStateFile(pd, setRuntimeField(readStateFile(pd), UNIT_PUSH_FIELD, "later")));
+    console.log(JSON.stringify({ pushed: false, notice: `Nothing is pushed. Say push when ${unit} is ready to go home.` }));
+    return;
+  }
+  const manifest = readUnitSourceManifest(pd, "code-generation", unit);
+  if (!manifest.ok) fail(`${unit} has no record of what its Code Generation wrote yet (${manifest.reason}).`);
+  const byRepo = writesByRepo(pd, manifest.manifest.writes);
+  // A build by file has no home to reach; its result goes back as a file.
+  const byFile = getField(state, "Home Result")?.trim() === "by file";
+  const home = byFile ? null : buildsHome(pd, build);
+  const ref = home === null ? null : claimRef(home.id8, unit);
+  if (home !== null && ref !== null && home.target !== null) ensureFetchedClaim(pd, home, ref);
+  const claim = home === null || ref === null ? null : currentClaim(pd, home.target, ref);
+  const label = getField(state, "Home Label")?.trim() || build.homeRecord;
+  const earlier = new Map((claim?.payload.result?.repos ?? []).map((repo) => [repo.repo, repo]));
+  const results: RepoResult[] = [];
+  const switched: string[] = [];
+  for (const [repo, paths] of byRepo) {
+    const dir = repo === "." ? pd : repoDir(pd, repo);
+    if (!isGitRepoDir(dir)) fail(repoNotThereLine(pd, repo));
+    const name = repo === "." ? "the repo" : repo;
+    if (git(dir, ["branch", "--show-current"]).stdout.trim() !== unit) {
+      const exists = git(dir, ["rev-parse", "--verify", "--quiet", `refs/heads/${unit}`]).ok;
+      const moved = git(dir, exists ? ["switch", unit] : ["switch", "-c", unit]);
+      if (!moved.ok) fail(`Branch ${unit} could not be checked out in ${name}: ${moved.stderr.trim()}`);
+      switched.push(name);
+    }
+    const added = git(dir, ["add", "--", ...paths]);
+    if (!added.ok) fail(`${unit}'s changes could not be added in ${name}: ${added.stderr.trim()}`);
+    if (!git(dir, ["diff", "--cached", "--quiet", "--", ...paths]).ok) {
+      const committed = git(dir, ["commit", "-q", "-m", `${unit}: ${label}`, "--", ...paths]);
+      if (!committed.ok) fail(`The commit in ${name} did not go through: ${(committed.stderr || committed.stdout).trim()}`);
+    }
+    const remote = git(dir, ["config", "--get", `branch.${unit}.remote`]).stdout.trim() || repositoryRemote(dir);
+    if (remote === null) fail(`${name} has no remote to push ${unit} to.`);
+    const pushed = git(dir, ["push", "-u", remote, unit]);
+    if (!pushed.ok) fail(`The push of ${unit} in ${name} was refused: ${pushRefusal(pushed.stderr)}. Nothing was retried.`);
+    const head = git(dir, ["rev-parse", "HEAD"]).stdout.trim();
+    const base = earlier.get(repo)?.base ??
+      (git(dir, ["merge-base", "HEAD", repoIntegration(dir, remote)]).stdout.trim() || head);
+    const changed = git(dir, ["diff", "--name-only", "--no-renames", base, head, "--", ...paths]).stdout.split(/\r?\n/).filter(Boolean);
+    const blobs = blobsAt(dir, head, changed);
+    const url = git(dir, ["remote", "get-url", remote]).stdout.trim();
+    const entry: RepoResult = {
+      repo,
+      ...(url ? { url } : {}),
+      branch: unit,
+      base,
+      heads: [...new Set([...(earlier.get(repo)?.heads ?? []), head])],
+      paths: Object.fromEntries(changed.map((path) => [path, blobs.get(path) ?? null])),
+      ...(() => {
+        const id = patchIdOf(dir, base, head, changed);
+        return id ? { patch_id: id } : {};
+      })(),
+    };
+    // For a home that cannot fetch this repo, the team's own check goes with
+    // the result file, recorded at the home as the team's word.
+    if (byFile) {
+      git(dir, ["fetch", "-q", remote]);
+      const verdict = unitMergeVerdict(dir, repoIntegration(dir, remote), entry);
+      entry.reported = verdict.merged ? { merged: true, commit: verdict.commit } : { merged: false };
+    }
+    results.push(entry);
+  }
+  const names = results.map((repo) => (repo.repo === "." ? "the repo" : repo.repo));
+  const lines = [`Pushed branch ${unit} in ${joinNames(names)}. Open a PR in ${names.length === 1 ? "it" : "each"} your usual way.`];
+  if (switched.length > 0) lines.push(`You are on branch ${unit} in ${joinNames(switched)} now.`);
+  // The result goes home on the claim, with the Unit outputs the home's later
+  // stages read; a home that takes no push from here gets it as a file.
+  const outputs = unitOutputsHomeReads(unit, getField(state, "Scope") ?? "")
+    .filter((rel) => existsSync(join(activeRecordDir(pd), ...rel.split("/"))));
+  const result: UnitResult = { by: git(pd, ["config", "user.name"]).stdout.trim() || "a teammate", repos: results, outputs };
+  if (claim === null || ref === null || home === null) {
+    const rel = handFilePath(label, unit, "-result");
+    writeHandFile(pd, rel, renderHandFile(
+      "result",
+      `Result: ${unit} of ${label}`,
+      "Take it in at the home with `/aidlc <this file>`.",
+      {
+        "Home Work": build.homeWork,
+        "Home Label": label,
+        Unit: unit,
+        Attempt: String(build.attempt),
+        Team: activeSpace(pd),
+        "Built By": result.by,
+        Written: isoTimestamp(),
+      },
+      new Map(outputs.map((rel) => [rel, readFileSync(join(activeRecordDir(pd), ...rel.split("/")), "utf-8")])),
+      result,
+    ));
+    lines.push(`The result file is ${rel}; send it to the lead.`);
+  } else {
+    const files = Object.fromEntries(outputs.map((rel) => [
+      `${RESULT_FILES_ROOT}/${rel}`,
+      readFileSync(join(activeRecordDir(pd), ...rel.split("/")), "utf-8"),
+    ]));
+    const payload: UnitClaimPayload = { ...claim.payload, predecessor_oid: claim.oid, result, verdicts: undefined };
+    const commit = createClaimCommit(pd, claim.oid, payload, undefined, undefined, files);
+    const sent = updateClaimRef(pd, home.target, ref, commit, claim.oid);
+    if (!sent.ok) lines.push(`The home did not take ${unit}'s result: ${sent.refused ?? "its claim moved meanwhile"}. Say push to send it again.`);
+    else invalidateLiveClaimPayloadCache(pd, unit);
+  }
+  withAuditLock(pd, () => {
+    writeStateFile(pd, setRuntimeField(readStateFile(pd), UNIT_PUSH_FIELD, "pushed"));
+    appendAuditEntryUnlocked("UNIT_PUSHED", {
+      Unit: unit,
+      Branch: unit,
+      Repos: results.map((repo) => `${repo.repo}@${repo.heads.at(-1)}`).join(", "),
+    }, pd);
+  });
+  console.log(JSON.stringify({ pushed: true, unit, repos: results.map((repo) => repo.repo), notice: lines.join(" ") }));
+}
+
+function activeRecordDir(projectDir: string): string {
+  const record = recordDir(projectDir);
+  if (record === null) fail("No piece of work is selected here.");
+  return record;
+}
+
+function joinNames(names: string[]): string {
+  return names.length <= 1 ? names.join("") : `${names.slice(0, -1).join(", ")} and ${names.at(-1)}`;
+}
+
+// --- At the home: what came back, and what merged -----------------------------
+//
+// For each Unit a team holds with a result on its claim and not yet done: fetch
+// each repo's integration branch with the person's own login, check whether
+// the Unit's part is merged, put the verdicts on the claim, and once every repo
+// merged record the Unit done (UNIT_MERGED, under the per-intent lock), write
+// the Unit outputs the home's later stages read into its record, and mark the
+// claim done so the Units waiting on it open everywhere. A repo the home has
+// no checkout of keeps the team's result as theirs until the home can check it.
+// `unreached` collects the remotes that could not be read, `unsent` the ones
+// that did not take a verdict.
+export function checkTeamResults(
+  projectDir: string,
+  unreached?: string[],
+  unsent?: string[],
+): Map<string, { team: string; verdicts: NonNullable<UnitClaimPayload["verdicts"]>; done: boolean }> {
+  const pd = resolveProjectDir(projectDir);
+  return quietly(pd, () => checkTeamResultsQuietly(pd, unreached, unsent));
+}
+
+function checkTeamResultsQuietly(
+  pd: string,
+  unreached?: string[],
+  unsent?: string[],
+): Map<string, { team: string; verdicts: NonNullable<UnitClaimPayload["verdicts"]>; done: boolean }> {
+  const found = new Map<string, { team: string; verdicts: NonNullable<UnitClaimPayload["verdicts"]>; done: boolean }>();
+  const identity = activeIdentity(pd);
+  const remote = repositoryRemote(pd);
+  for (const [unit, claim] of cachedClaims(pd)) {
+    if (claim.status !== "claimed" || claim.payload.result === undefined) continue;
+    if (claim.payload.done) {
+      found.set(unit, { team: claim.owner, verdicts: claim.payload.verdicts ?? [], done: true });
+      continue;
+    }
+    let live: UnitClaimView | null;
+    try {
+      live = currentClaim(pd, remote, claimRef(identity.intentId8, unit));
+    } catch {
+      unreached?.push(remote ?? "the home");
+      continue;
+    }
+    const result = live?.payload.result;
+    if (live?.status !== "claimed" || !result) continue;
+    const verdicts = result.repos.map((repo) => {
+      const said = live.payload.said_merged?.find((entry) => entry.repo === repo.repo);
+      if (said) return { repo: repo.repo, merged: true, how: `by your word: "${said.words}"` };
+      const dir = repo.repo === "." ? pd : repoDir(pd, repo.repo);
+      if (!isGitRepoDir(dir)) {
+        // The team's own word, kept as theirs until the home can check the repo.
+        return repo.reported?.merged
+          ? { repo: repo.repo, merged: true, commit: repo.reported.commit, how: `reported by ${live.owner}` }
+          : { repo: repo.repo, merged: false };
+      }
+      const repoRemote = repositoryRemote(dir);
+      if (repoRemote !== null && !quietFetch(dir, ["-q", repoRemote]).ok) unreached?.push(repo.repo === "." ? repoRemote : repo.repo);
+      const verdict = unitMergeVerdict(dir, repoRemote === null ? "HEAD" : repoIntegration(dir, repoRemote), repo);
+      return verdict.merged ? { repo: repo.repo, merged: true, commit: verdict.commit, how: verdict.how } : { repo: repo.repo, merged: false };
+    });
+    const done = verdicts.length > 0 && verdicts.every((verdict) => verdict.merged) &&
+      (!leadSignOffOn(readStateFile(pd)) || live.payload.signoff !== undefined);
+    const same = JSON.stringify(live.payload.verdicts ?? []) === JSON.stringify(verdicts);
+    if (done) recordUnitDone(pd, live, verdicts);
+    if (!same || done) {
+      const payload: UnitClaimPayload = { ...live.payload, predecessor_oid: live.oid, verdicts, ...(done ? { done: true as const } : {}) };
+      const commit = createClaimCommit(pd, live.oid, payload);
+      // Unwritten, the verdict stays here and the next step writes it again.
+      if (updateClaimRef(pd, remote, live.ref, commit, live.oid).ok) invalidateLiveClaimPayloadCache(pd, unit);
+      else unsent?.push(remote ?? "the home");
+    }
+    found.set(unit, { team: live.owner, verdicts, done });
+  }
+  return found;
+}
+
+function recordUnitDone(projectDir: string, claim: UnitClaimView, verdicts: NonNullable<UnitClaimPayload["verdicts"]>): void {
+  const record = activeRecordDir(projectDir);
+  for (const rel of claim.payload.result?.outputs ?? []) {
+    const shown = git(projectDir, ["show", `${claim.oid}:${RESULT_FILES_ROOT}/${rel}`, "--"]);
+    if (!shown.ok) continue;
+    mkdirSync(dirname(join(record, ...rel.split("/"))), { recursive: true });
+    writeFileSync(join(record, ...rel.split("/")), shown.stdout, "utf-8");
+  }
+  withAuditLock(projectDir, () => {
+    const already = readAuditShardEvents(projectDir).some((row) =>
+      row.event === "UNIT_MERGED" && auditBlockField(row.block, "Unit") === claim.unit &&
+      auditBlockField(row.block, "Attempt Generation") === String(claim.generation)
+    );
+    if (already) return;
+    appendAuditEntryUnlocked("UNIT_MERGED", {
+      Unit: claim.unit,
+      Owner: claim.owner,
+      "Built By": claim.payload.result?.by ?? claim.payload.taken_by ?? claim.owner,
+      "Merged In": verdicts.map((verdict) => `${verdict.repo}${verdict.commit ? `@${verdict.commit}` : ""} (${verdict.how})`).join(", "),
+      "Attempt Generation": String(claim.generation),
+    }, projectDir);
+  });
+}
+
+// What the home said about this build's Unit, read from the claims git last
+// brought in, each said once: a turn-down in the home's words, the home's
+// answer to a proposal, a Unit it started early on that is now done or turned
+// down, and an input the home amended (the copy here takes the new version,
+// and the stages that used it read as current, on every Guard Policy).
+export function buildClaimNotes(projectDir: string, stateContent: string, sessionId?: string): string[] {
+  const build = unitBuildOf(stateContent);
+  if (build === null) return [];
+  const space = build.homeRecord.slice(0, build.homeRecord.indexOf("/"));
+  const lines: string[] = [];
+  if (!isReadOnlyEngineProbe() && getField(stateContent, "Home Result")?.trim() !== "by file") {
+    let home: HomeWork | null = null;
+    try {
+      home = buildsHome(projectDir, build);
+    } catch {
+      // The home's record is not here: what this workspace has stands.
+    }
+    if (home !== null && refreshHomeClaims(projectDir, { home, sessionId }).unreached !== null) {
+      lines.push("The home could not be reached just now, so news from it may be behind.");
+    }
+  }
+  let claims: Map<string, UnitClaimView>;
+  try {
+    claims = cachedClaimsForIdentity(projectDir, { space, intentUuid: build.homeWork, intentId8: idSuffix(build.homeWork) }, false);
+  } catch {
+    return lines;
+  }
+  const mine = claims.get(build.unit);
+  if (mine === undefined) return lines;
+  const unit = build.unit;
+  const down = mine.payload.turned_down;
+  if (down) {
+    lines.push(`${unit} was turned down in ${down.repo} at the home${down.words ? `: "${down.words}"` : ""}. ` +
+      "Say go back to Code Generation to change it, then push again.");
+  }
+  for (const proposal of mine.payload.proposals ?? []) {
+    if (proposal.answer === "approved") lines.push(`The home approved your change to the ${inputName(proposal.input)}.`);
+    if (proposal.answer === "turned down") {
+      lines.push(`The home turned down your change to the ${inputName(proposal.input)}` +
+        `${proposal.answer_words ? `: "${proposal.answer_words}"` : ""}. I'm carrying on with the approved one.`);
+    }
+  }
+  for (const dep of mine.payload.early_on ?? []) {
+    const theirs = claims.get(dep.unit)?.payload;
+    if (theirs?.done) lines.push(`${dep.unit} is done at the home. ${unit} started early on its branch: rebase on it when you are ready.`);
+    else if (theirs?.turned_down) {
+      lines.push(`${dep.unit} was turned down at the home; ${unit} started on its branch. Nothing else changes: wait for it, ` +
+        "or rebase when you are ready.");
+    }
+  }
+  if (isReadOnlyEngineProbe()) return lines;
+  const record = recordDir(projectDir);
+  for (const amendment of mine.payload.amendments ?? []) {
+    if (record === null) break;
+    const shown = git(projectDir, ["show", `${mine.oid}:${RESULT_FILES_ROOT}/amendments/${amendment.input}`, "--"]);
+    const path = join(record, ...amendment.input.split("/"));
+    if (!shown.ok || (existsSync(path) && textFingerprint(readFileSync(path, "utf-8")) === textFingerprint(shown.stdout))) continue;
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(path, shown.stdout, "utf-8");
+    const renewed = renewForAmendedInput(projectDir, amendment.input, { Unit: unit, "Amended At Home": amendment.at });
+    const name = inputName(amendment.input);
+    if (mine.payload.done) {
+      lines.push(`The ${name} changed at the home after ${unit} was done. Do you want me to start follow-up work for it?`);
+    } else if (renewed.length > 0) {
+      lines.push(staleStageLine(stageLabel(loadGraph().find((stage) => stage.slug === renewed[0]), renewed[0]) ?? renewed[0]));
+    } else {
+      lines.push(`The ${name} changed at the home; ${unit} uses the new one from here.`);
+    }
+  }
+  return lines;
+}
+
+// The finished stages of this work that used an amended input read as current:
+// the person who owns it approved the change, so nothing is stale and nothing
+// resets. Returns the stages renewed, in the work's order.
+function renewForAmendedInput(projectDir: string, rel: string, extra: Record<string, string>): string[] {
+  const at = artifactAt(rel);
+  if (at === null) return [];
+  const state = readStateFile(projectDir);
+  const graph = loadGraph();
+  const receipts = latestCompletionBasesFromAudit(readAllAuditShards(projectDir));
+  const renewed: string[] = [];
+  withAuditLock(projectDir, () => {
+    for (const [stage, basis] of receipts) {
+      if (![...basis.inputs, ...basis.outputs].some((entry) => entry.artifact === at.artifact && entry.producer === at.producer)) continue;
+      const node = graph.find((entry) => entry.slug === stage);
+      if (node === undefined) continue;
+      appendAuditEntryUnlocked("SHARED_INPUT_AMENDED", {
+        ...sharedInputAmendedFields(stage, captureStageValidationBasis(projectDir, node, state, graph), rel),
+        ...extra,
+      }, projectDir);
+      renewed.push(stage);
+    }
+  });
+  return renewed;
+}
+
+// A build proposes a change to one input it was approved with: from the
+// person's own file, or their edited copy. The build carries on meanwhile.
+function proposeChange(args: string[], projectDir?: string): void {
+  const { flags } = parseArgs(args);
+  if (!flags.input) fail("Usage: aidlc-unit propose --input <file it was approved with> [--file <changed text>] [--person-words '<their words>']");
+  const pd = resolveProjectDir(projectDir);
+  const state = readStateFile(pd);
+  const build = unitBuildOf(state);
+  if (build === null) fail("A change is proposed from a Unit's build; this work is not one.");
+  const record = activeRecordDir(pd);
+  const approved = approvedInputsOf(record).filter((entry) => !entry.path.endsWith("unit-of-work-dependency.md"));
+  const match = approved.find((entry) =>
+    entry.path === flags.input || entry.path.endsWith(`/${flags.input}`) || entry.path.endsWith(`/${artifactFilename(flags.input!)}`)
+  );
+  if (match === undefined) {
+    fail(`${flags.input} is not one of the files ${build.unit} was approved with (${approved.map((entry) => entry.path.split("/").at(-1)).join(", ")}).`);
+  }
+  const name = inputName(match.path);
+  const text = flags.file !== undefined ? readFileSync(resolve(pd, flags.file), "utf-8") : readFileSync(join(record, ...match.path.split("/")), "utf-8");
+  if (textFingerprint(text) === match.fingerprint) {
+    console.log(JSON.stringify({ proposed: false, notice: `The ${name} is as the home approved it, so there is no change to send.` }));
+    return;
+  }
+  if (getField(state, "Home Result")?.trim() === "by file") {
+    fail(`The home takes no push from here: send your change to the ${name} to the lead with your result file.`);
+  }
+  const home = buildsHome(pd, build);
+  const ref = claimRef(home.id8, build.unit);
+  if (home.target !== null) ensureFetchedClaim(pd, home, ref);
+  const live = currentClaim(pd, home.target, ref);
+  if (live?.status !== "claimed") fail(`${build.unit} is not held at the home, so there is no claim to send the change on.`);
+  const proposal: Proposal = {
+    input: match.path,
+    by: git(pd, ["config", "user.name"]).stdout.trim() || "a teammate",
+    words: flags["person-words"]?.trim() ?? "",
+    at: isoTimestamp(),
+  };
+  const payload: UnitClaimPayload = {
+    ...live.payload,
+    predecessor_oid: live.oid,
+    proposals: [...(live.payload.proposals ?? []).filter((entry) => entry.input !== match.path || entry.answer !== undefined), proposal],
+  };
+  const sent = updateClaimRef(pd, home.target, ref, createClaimCommit(pd, live.oid, payload, undefined, undefined, {
+    [`${RESULT_FILES_ROOT}/proposals/${match.path}`]: text,
+  }), live.oid);
+  if (!sent.ok) fail(`The home did not take the change: ${sent.refused ?? "its claim moved meanwhile"}. Try again.`);
+  invalidateLiveClaimPayloadCache(pd, build.unit);
+  console.log(JSON.stringify({
+    proposed: true,
+    notice: `Sent to the home: your change to the ${name}. I'm carrying on with ` +
+      `${flags.file !== undefined ? `the approved ${name}` : "your version here"} until the home decides.`,
+  }));
+}
+
+export function amendAskName(unit: string, input: string): string {
+  return `amend-${unit}-${input.replace(/[^A-Za-z0-9.-]+/g, "_")}.json`;
+}
+
+// At the home: the owner of the shared plan answers a team's proposal, in their
+// own words, under the rules for a person's answer (their reply after it was
+// shown, not empty, not a cancellation, not the agent's). An approved change
+// is written into the home's record, the home's stages that used it read as
+// current, and every team building with it gets it on its claim (a team by
+// file, a newer hand-off file).
+function amendInput(args: string[], projectDir?: string): void {
+  const { positional, flags } = parseArgs(args);
+  const unit = positional[0];
+  const answer = flags.answer;
+  const words = flags["person-words"]?.trim() ?? "";
+  if (!unit || !flags.input || (answer !== "approve" && answer !== "reject")) {
+    fail("Usage: aidlc-unit amend <unit> --input <file> --answer <approve|reject> --person-words '<their words>'");
+  }
+  const pd = resolveProjectDir(projectDir);
+  const identity = activeIdentity(pd);
+  const remote = repositoryRemote(pd);
+  const live = currentClaim(pd, remote, claimRef(identity.intentId8, unit));
+  const proposal = live?.payload.proposals?.find((entry) => entry.input === flags.input && entry.answer === undefined);
+  if (!live || proposal === undefined) fail(`${unit} has no change to ${flags.input} waiting for an answer.`);
+  if (!humanPresenceGuardDisabled() && !personAskedSinceGate(pd)) {
+    fail("The answer to a proposed change is the person's own word: ask them first, then run this with their words.");
+  }
+  const name = inputName(proposal.input);
+  const answered: Proposal = { ...proposal, answer: answer === "approve" ? "approved" : "turned down", ...(words ? { answer_words: words } : {}) };
+  const lines: string[] = [];
+  if (answer === "approve") {
+    const shown = git(pd, ["show", `${live.oid}:${RESULT_FILES_ROOT}/proposals/${proposal.input}`, "--"]);
+    if (!shown.ok) fail(`The proposed ${name} is not on ${unit}'s claim; ask the team to send it again.`);
+    const path = join(activeRecordDir(pd), ...proposal.input.split("/"));
+    writeFileSync(path, shown.stdout, "utf-8");
+    renewForAmendedInput(pd, proposal.input, { "Proposed By": `${proposal.by} (${live.owner})`, "Person Words": words });
+    const amendment: Amendment = { input: proposal.input, at: isoTimestamp(), words };
+    for (const [other, claim] of cachedClaims(pd)) {
+      if (claim.status !== "claimed") continue;
+      const current = currentClaim(pd, remote, claim.ref);
+      if (current?.status !== "claimed") continue;
+      const payload: UnitClaimPayload = {
+        ...current.payload,
+        predecessor_oid: current.oid,
+        amendments: [...(current.payload.amendments ?? []).filter((entry) => entry.input !== proposal.input), amendment],
+        ...(other === unit ? { proposals: (current.payload.proposals ?? []).map((entry) => (entry === proposal || (entry.input === proposal.input && entry.answer === undefined) ? answered : entry)) } : {}),
+      };
+      updateClaimRef(pd, remote, current.ref, createClaimCommit(pd, current.oid, payload, undefined, undefined, {
+        [`${RESULT_FILES_ROOT}/amendments/${proposal.input}`]: shown.stdout,
+      }), current.oid);
+      invalidateLiveClaimPayloadCache(pd, other);
+      if (current.payload.by_file && !current.payload.taken_by) {
+        lines.push(`A newer hand-off file for ${other} is at ${writeHandOffFile(pd, other, current.owner, current.generation)}: send it to ${current.owner}.`);
+      }
+    }
+    lines.unshift(`The ${name} is changed at the home. The teams building with it hear it once and carry on; nobody approves anything again.`);
+  } else {
+    const payload: UnitClaimPayload = {
+      ...live.payload,
+      predecessor_oid: live.oid,
+      proposals: (live.payload.proposals ?? []).map((entry) => (entry.input === proposal.input && entry.answer === undefined ? answered : entry)),
+    };
+    const sent = updateClaimRef(pd, remote, live.ref, createClaimCommit(pd, live.oid, payload), live.oid);
+    if (!sent.ok) fail(`${unit}'s claim moved meanwhile: ${sent.refused ?? "try again"}.`);
+    invalidateLiveClaimPayloadCache(pd, unit);
+    lines.push(`Turned down ${live.owner}'s change to the ${name}; they hear it once, with your words.`);
+  }
+  appendAuditEntry("QUESTION_ANSWERED", {
+    Question: `${live.owner} proposes a change to the ${name} for ${unit}`,
+    Answer: answer === "approve" ? "Approve it" : "Turn it down",
+    "Person Reply": words,
+  }, pd);
+  console.log(JSON.stringify({ answered: answered.answer, unit, notice: lines.join(" ") }));
+}
+
+// The home's person turned a Unit's repo down: their words go on the claim,
+// and the team hears them, once, at its next step.
+function turnedDown(args: string[], projectDir?: string): void {
+  const { positional, flags } = parseArgs(args);
+  const unit = positional[0];
+  if (!unit || !flags.repo) fail("Usage: aidlc-unit turned-down <unit> --repo <repo> --person-words '<their words>'");
+  const pd = resolveProjectDir(projectDir);
+  const words = flags["person-words-file"] !== undefined
+    ? readAnswerTextFile(pd, flags["person-words-file"])
+    : flags["person-words"] ?? "";
+  if (!humanPresenceGuardDisabled() && !personAskedSinceGate(pd)) {
+    fail("A turn-down is the person's own word: ask them first, then run this with their words.");
+  }
+  const identity = activeIdentity(pd);
+  const remote = repositoryRemote(pd);
+  const live = currentClaim(pd, remote, claimRef(identity.intentId8, unit));
+  if (live?.status !== "claimed" || !live.payload.result) fail(`${unit} has no result from its team to turn down.`);
+  const payload: UnitClaimPayload = {
+    ...live.payload,
+    predecessor_oid: live.oid,
+    turned_down: { repo: flags.repo, words: words.trim(), at: isoTimestamp() },
+  };
+  const sent = updateClaimRef(pd, remote, live.ref, createClaimCommit(pd, live.oid, payload), live.oid);
+  if (!sent.ok) fail(`The note could not be put on ${unit}'s claim: ${sent.refused ?? "it moved meanwhile"}. Try again.`);
+  invalidateLiveClaimPayloadCache(pd, unit);
+  console.log(JSON.stringify({ unit, notice: `The ${live.owner} team hears that ${flags.repo} was turned down, with your words, at its next step.` }));
+}
+
+// The lead says a repo merged the Unit where the merge check cannot see it (a
+// change made again by hand, a branch merged elsewhere): their words go on the
+// claim, and the home counts that repo merged at its next step.
+function saidMerged(args: string[], projectDir?: string): void {
+  const { positional, flags } = parseArgs(args);
+  const unit = positional[0];
+  if (!unit || !flags.repo) fail("Usage: aidlc-unit merged <unit> --repo <repo> --person-words '<their words>'");
+  const pd = resolveProjectDir(projectDir);
+  const words = (flags["person-words-file"] !== undefined ? readAnswerTextFile(pd, flags["person-words-file"]) : flags["person-words"] ?? "").trim();
+  if (!humanPresenceGuardDisabled() && !personAskedSinceGate(pd)) {
+    fail("That it merged is the person's own word: ask them first, then run this with their words.");
+  }
+  const identity = activeIdentity(pd);
+  const remote = repositoryRemote(pd);
+  const live = currentClaim(pd, remote, claimRef(identity.intentId8, unit));
+  if (live?.status !== "claimed" || !live.payload.result) fail(`${unit} has no result from its team to count merged.`);
+  if (!live.payload.result.repos.some((repo) => repo.repo === flags.repo)) {
+    fail(`${unit} changed ${joinNames(live.payload.result.repos.map((repo) => repo.repo))}, not ${flags.repo}.`);
+  }
+  const payload: UnitClaimPayload = {
+    ...live.payload,
+    predecessor_oid: live.oid,
+    said_merged: [...(live.payload.said_merged ?? []).filter((entry) => entry.repo !== flags.repo), { repo: flags.repo, words, at: isoTimestamp() }],
+  };
+  const sent = updateClaimRef(pd, remote, live.ref, createClaimCommit(pd, live.oid, payload), live.oid);
+  if (!sent.ok) fail(`${unit}'s claim moved meanwhile: ${sent.refused ?? "try again"}.`);
+  invalidateLiveClaimPayloadCache(pd, unit);
+  console.log(JSON.stringify({ unit, notice: `${flags.repo} counts as merged for ${unit}, in your words.` }));
+}
+
+// --- Hand-off by file ------------------------------------------------------------
+//
+// For a team that cannot reach the home's repository: the lead holds the Unit
+// for the team and writes one readable file with what it was approved with; the
+// team starts its build from it and sends progress and its result back as
+// files the lead takes in.
+
+function handFilePath(label: string, unit: string, suffix = ""): string {
+  return `${HANDOFF_DIR}/${slugify(label) || "work"}-${unit}${suffix}.md`;
+}
+
+function writeHandFile(projectDir: string, rel: string, text: string): void {
+  mkdirSync(dirname(join(projectDir, ...rel.split("/"))), { recursive: true });
+  writeFileSync(join(projectDir, ...rel.split("/")), text, "utf-8");
+}
+
+function readHandFile(projectDir: string, path: string): HandFile | null {
+  try {
+    return parseHandFile(readFileSync(resolve(projectDir, path), "utf-8"));
+  } catch {
+    fail(`${path} could not be read.`);
+  }
+}
+
+function handOff(args: string[], projectDir?: string): void {
+  const { positional, flags } = parseArgs(args);
+  const unit = positional[0];
+  const team = flags.team?.trim();
+  if (!unit || !team) fail("Usage: aidlc-unit hand-off <unit> --team <team> [--person-words '<their words>']");
+  if (/[\r\n|]/.test(team)) fail("Team labels cannot contain pipes or newlines.");
+  const pd = resolveProjectDir(projectDir);
+  const state = readStateFile(pd);
+  const location = homeLocation(state);
+  if (!isTeamUnitOwnership(state) || location === null) fail("Units are handed off once teams are chosen for this work.");
+  const local = localOpeningStatus(pd);
+  if (!local.units.includes(unit)) fail(`${unit} is not one of this work's Units (${local.units.join(", ")}).`);
+  const identity = activeIdentity(pd);
+  const integration = fetchIntegration(pd);
+  const ref = claimRef(identity.intentId8, unit);
+  const current = currentClaim(pd, integration.remote, ref);
+  if (current?.status === "claimed" && current.owner !== team) fail(`${unit} is held by ${current.owner}, so it stays with them.`);
+  if (current?.payload.taken_by !== undefined) fail(`${unit} is already taken by ${current.payload.taken_by} of ${current.owner}.`);
+  const payload: UnitClaimPayload = current?.status === "claimed"
+    ? { ...current.payload, predecessor_oid: current.oid, by_file: true }
+    : {
+      version: 1,
+      status: "claimed",
+      owner: team,
+      space: identity.space,
+      intent_uuid: identity.intentUuid,
+      intent_id8: identity.intentId8,
+      unit,
+      generation: current?.status === "released" ? current.generation : (current?.generation ?? 0) + 1,
+      nonce: randomUUID(),
+      base_oid: integration.oid,
+      integration_ref: integration.ref,
+      claim_ref: ref,
+      predecessor_oid: current?.oid ?? null,
+      gate_rhythm: readUnitGateRhythm(state),
+      assigned: true,
+      by_file: true,
+    };
+  const held = updateClaimRef(pd, integration.remote, ref, createClaimCommit(pd, current?.oid ?? integration.oid, payload), current?.oid ?? null);
+  if (!held.ok) fail(`${unit} could not be held for ${team}: ${held.refused ?? "its claim moved meanwhile"}. Try again.`);
+  invalidateLiveClaimPayloadCache(pd, unit);
+  const rel = writeHandOffFile(pd, unit, team, payload.generation);
+  const words = flags["person-words"]?.trim() ?? "";
+  appendAuditEntry("UNITS_ASSIGNED", {
+    Assigned: `${unit}=${team}`,
+    "By File": rel,
+    ...(words ? { "Person Words": words } : {}),
+  }, pd);
+  console.log(JSON.stringify({
+    unit,
+    team,
+    file: rel,
+    notice: `The hand-off file for ${unit} is ${rel}: send it to the ${team} team. They take it in with ` +
+      `/aidlc <the file> in their own workspace, and send its result back to you as a file.`,
+  }));
+}
+
+// The hand-off file for a Unit held for a team by file, from the home's record
+// as it is now. Returns its workspace-relative path.
+function writeHandOffFile(pd: string, unit: string, team: string, attempt: number): string {
+  const state = readStateFile(pd);
+  const identity = activeIdentity(pd);
+  const integration = fetchIntegration(pd);
+  const record = activeRecordDir(pd);
+  const files = new Map<string, string>([["aidlc-state.md", state]]);
+  for (const rel of homeInputPaths(unitMajorConstructionStageSlugs(getField(state, "Scope") ?? "", state, true))) {
+    if (existsSync(join(record, ...rel.split("/")))) files.set(rel, readFileSync(join(record, ...rel.split("/")), "utf-8"));
+  }
+  const produced = new Set([...files.keys()].map((rel) => rel.split("/")[1]));
+  const approvals = readAuditShardEvents(pd).filter((row) => row.event === "GATE_APPROVED" && produced.has(auditBlockField(row.block, "Stage") ?? ""))
+    .map((row) => `${auditBlockField(row.block, "Stage")} approved at the home ${auditBlockField(row.block, "Timestamp") ?? ""}`.trim());
+  const row = readIntentRegistry(pd, identity.space).find((entry) => entry.uuid === identity.intentUuid);
+  const label = row?.slug ?? unit;
+  const rel = handFilePath(label, unit);
+  writeHandFile(pd, rel, renderHandFile(
+    "handoff",
+    `Hand-off: ${unit} of ${label}`,
+    `This file hands ${unit} to the ${team} team. Take it in with \`/aidlc <this file>\` in your own ` +
+      "workspace; AI-DLC starts it as a piece of work of its own. It is not signed: it is bound by the work's id, the " +
+      "Unit, the attempt and the fingerprints below.",
+    {
+      "Home Work": identity.intentUuid,
+      "Home Location": homeLocation(state) ?? "",
+      "Home Record": `${identity.space}/${row?.dirName ?? ""}`,
+      "Home Label": label,
+      Unit: unit,
+      Team: team,
+      Attempt: String(attempt),
+      "Home Commit": integration.oid,
+      "Handed Off": isoTimestamp(),
+      "Home Approvals": approvals.join("; ") || "none recorded",
+      Repos: (row?.repos ?? []).join(", "),
+    },
+    files,
+  ));
+  return rel;
+}
+
+function takeFromFile(pd: string, path: string): void {
+  const file = readHandFile(pd, path);
+  if (file === null || file.kind !== "handoff") fail(`${path} is not a hand-off file.`);
+  const fields = file.fields;
+  const unit = fields.Unit ?? "";
+  const unitError = validateUnitName(unit);
+  if (unitError) fail(`${path}: ${unitError}`);
+  const at = (fields["Home Record"] ?? "").indexOf("/");
+  const home: HomeRef = {
+    location: fields["Home Location"] ?? "",
+    uuid: fields["Home Work"] ?? "",
+    space: fields["Home Record"]?.slice(0, at) ?? DEFAULT_SPACE,
+    dirName: fields["Home Record"]?.slice(at + 1) ?? "",
+    label: fields["Home Label"] ?? unit,
+  };
+  const existing = findUnitBuild(pd, home.uuid, unit);
+  if (existing !== null) {
+    setActiveSpaceCursor(pd, existing.space);
+    selectIntentForSession(pd, existing.dirName, existing.space);
+    console.log(JSON.stringify({ taken: true, resumed: true, unit, space: existing.space, record: existing.dirName,
+      notice: `Carrying on ${unit}, the ${existing.space} team's build here.` }));
+    return;
+  }
+  const state = file.files.get("aidlc-state.md");
+  if (state === undefined) fail(`${path} holds no plan for ${unit}.`);
+  const team = fields.Team || "a team";
+  const approvals = (fields["Home Approvals"] ?? "").split("; ").filter((line) => line && line !== "none recorded");
+  const build = createUnitBuild(pd, home, { state }, fields["Home Commit"] ?? "", unit, team, Number(fields.Attempt) || 1, {
+    read: (rel) => file.files.get(rel) ?? null,
+    approvals: () => approvals,
+  });
+  withAuditLock(pd, () => {
+    writeStateFile(pd, setRuntimeField(readStateFile(pd, build.dirName, build.space), "Home Result", "by file"), build.dirName, build.space);
+  });
+  setActiveSpaceCursor(pd, build.space);
+  const repos = (fields.Repos ?? "").split(",").map((repo) => repo.trim()).filter(Boolean);
+  const likely = unitLikelyRepos(pd, build.dirName, build.space).get(unit) ?? [];
+  const missing = [...new Set(likely.map((repo) => repo.split("/")[0]))]
+    .filter((repo) => repos.includes(repo) && !isGitRepoDir(repoDir(pd, repo)));
+  console.log(JSON.stringify({
+    taken: true,
+    unit,
+    team,
+    space: build.space,
+    record: build.dirName,
+    notice: `${unit.charAt(0).toUpperCase()}${unit.slice(1)} is yours, handed off from ${home.label} by its lead on ` +
+      `${(fields["Handed Off"] ?? "").slice(0, 10)}. Its build is its own piece of work here, under your team's rules, ` +
+      "from what the home approved; its result goes back as a file when it is built." +
+      (file.edited ? " This file was changed after the lead wrote it: it is taken in as it is." : "") +
+      missing.map((repo) => ` ${repoNotThereLine(pd, repo)}`).join(""),
+  }));
+}
+
+// A build by file sends its progress whenever the person likes; nobody has to.
+function progressFile(projectDir?: string): void {
+  const pd = resolveProjectDir(projectDir);
+  const state = readStateFile(pd);
+  const build = unitBuildOf(state);
+  if (build === null) fail("A progress file is for a Unit's build; this work is not one.");
+  if (getField(state, "Home Result")?.trim() !== "by file") {
+    console.log(JSON.stringify({ notice: `${build.unit}'s progress reaches the home with your pushes; no file is needed.` }));
+    return;
+  }
+  const label = getField(state, "Home Label")?.trim() || build.unit;
+  const rel = handFilePath(label, build.unit, "-progress");
+  const stage = getField(state, "Current Stage")?.trim() ?? "";
+  writeHandFile(pd, rel, renderHandFile(
+    "progress",
+    `Progress: ${build.unit}`,
+    "Take it in at the home with `/aidlc <this file>`.",
+    { "Home Work": build.homeWork, "Home Label": label, Unit: build.unit, Attempt: String(build.attempt), Stage: stage, Written: isoTimestamp() },
+    new Map(),
+  ));
+  console.log(JSON.stringify({ file: rel, notice: `The progress file is ${rel}; send it to the lead if you like.` }));
+}
+
+// At the home: a team's result or progress file, onto the Unit's claim.
+function takeIn(args: string[], projectDir?: string): void {
+  const { positional } = parseArgs(args);
+  const path = positional[0];
+  if (!path) fail("Usage: aidlc-unit take-in <file>");
+  const pd = resolveProjectDir(projectDir);
+  const file = readHandFile(pd, path);
+  if (file === null || file.kind === "handoff") fail(`${path} is not a result or progress file.`);
+  const identity = activeIdentity(pd);
+  const unit = file.fields.Unit ?? "";
+  if (file.fields["Home Work"] !== identity.intentUuid) {
+    const other = file.fields["Home Label"]?.trim();
+    const here = readIntentRegistry(pd, identity.space).find((entry) => entry.uuid === identity.intentUuid)?.slug;
+    const named = other && other !== here ? ` (${other})` : "";
+    console.log(JSON.stringify({ taken_in: false, notice: `${path} is for other work${named}, not this one, so nothing changed.` }));
+    return;
+  }
+  const remote = repositoryRemote(pd);
+  const live = currentClaim(pd, remote, claimRef(identity.intentId8, unit));
+  if (live?.status !== "claimed") fail(`${unit} is not held for a team here, so this file has nothing to go into.`);
+  const lines: string[] = [];
+  if ((Number(file.fields.Attempt) || 0) < live.generation) lines.push(`This file is from an earlier attempt of ${unit}; it is taken in as the team's latest word.`);
+  if (file.edited) lines.push("This file was changed after the team wrote it: it is taken in as it is, and the result says so.");
+  const payload: UnitClaimPayload = { ...live.payload, predecessor_oid: live.oid };
+  const files: Record<string, string> = {};
+  if (file.kind === "progress") {
+    payload.progress = { stage: file.fields.Stage ?? "", at: file.fields.Written ?? "" };
+    const stage = file.fields.Stage ? stageLabel(loadGraph().find((entry) => entry.slug === file.fields.Stage), file.fields.Stage) : null;
+    lines.unshift(`Took in ${unit}'s progress from ${live.owner}: ${stage ?? "under way"}.`);
+  } else {
+    if (!file.result) fail(`${path} holds no result.`);
+    payload.result = { ...file.result, ...(file.edited ? { edited: true as const } : {}) };
+    payload.verdicts = undefined;
+    for (const [rel, text] of file.files) files[`${RESULT_FILES_ROOT}/${rel}`] = text;
+    lines.unshift(`Took in ${unit}'s result from ${live.owner}.`);
+  }
+  const sent = updateClaimRef(pd, remote, live.ref, createClaimCommit(pd, live.oid, payload, undefined, undefined, files), live.oid);
+  if (!sent.ok) fail(`${unit}'s claim moved while the file was taken in: ${sent.refused ?? "try again"}.`);
+  invalidateLiveClaimPayloadCache(pd, unit);
+  console.log(JSON.stringify({ taken_in: true, unit, kind: file.kind, notice: lines.join(" ") }));
+}
+
+// --- A second person on solo work -------------------------------------------------
+//
+// Solo work a teammate took a Unit of from another machine: this home's session
+// records the switch to teams at its next step (the teammate's clone never
+// writes it): its origin as the home, one approval at the end of each Unit as
+// it had, and the Units it already built here merged here. Nothing is asked
+// again. The line for the person, or null when nothing switched.
+export function switchSoloToTeams(projectDir: string): string | null {
+  let state: string;
+  try {
+    state = readStateFile(projectDir);
+  } catch {
+    return null;
+  }
+  if (isTeamUnitOwnership(state) || homeLocation(state) !== null || isReadOnlyEngineProbe()) return null;
+  if (getField(state, "Construction Iteration")?.trim() !== "unit-major" || !hasAnyUnitClaimRefs(projectDir)) return null;
+  let taken: UnitClaimView[];
+  try {
+    taken = [...cachedClaimsForIdentity(projectDir, activeIdentity(projectDir), false).values()]
+      .filter((claim) => claim.status === "claimed" && claim.payload.taken_by !== undefined);
+  } catch {
+    return null;
+  }
+  const location = workspaceHomeLocation(projectDir);
+  if (taken.length === 0 || location === null || location === "local") return null;
+  const finalStage = unitMajorConstructionStageSlugs(getField(state, "Scope") ?? "", state, true).at(-1) ?? "code-generation";
+  const builtHere = soloUnitsProgress(readAuditShardEvents(projectDir), finalStage).done;
+  const me = git(projectDir, ["config", "user.name"]).stdout.trim() || "this session";
+  const who = joinNames([...new Set(taken.map((claim) => claim.payload.taken_by!))]);
+  const units = joinNames(taken.map((claim) => claim.unit));
+  withAuditLock(projectDir, () => {
+    let content = readStateFile(projectDir);
+    content = setRuntimeField(content, "Unit Ownership", "team");
+    content = setRuntimeField(content, HOME_LOCATION_FIELD, location);
+    content = setRuntimeField(content, UNIT_GATE_RHYTHM_FIELD, "unit-end");
+    writeStateFile(projectDir, content);
+    appendAuditEntryUnlocked("UNIT_OWNERSHIP_SET", { Mode: "team", [HOME_LOCATION_FIELD]: location, Reason: `${who} took ${units} from another machine` }, projectDir);
+    for (const unit of builtHere) {
+      appendAuditEntryUnlocked("UNIT_MERGED", { Unit: unit, Owner: "here", "Built By": me, "Merged In": "built here before teams" }, projectDir);
+    }
+  });
+  return `Your teammate ${who} took ${units}; this session carries on with the rest, one Unit at a time.`;
+}
+
+// --- The lead's sign-off ------------------------------------------------------------
+//
+// Off by default, switched on per piece of work at the home: a team's result
+// then waits for the lead's own word before the Unit counts as done.
+export const LEAD_SIGNOFF_FIELD = "Lead Sign-off";
+
+export function leadSignOffOn(stateContent: string | null): boolean {
+  return getField(stateContent ?? "", LEAD_SIGNOFF_FIELD)?.trim() === "on";
+}
+
+function leadSignOffSetting(args: string[], projectDir?: string): void {
+  const value = args[0];
+  if (value !== "on" && value !== "off") fail("Usage: aidlc-unit lead-sign-off on|off");
+  const pd = resolveProjectDir(projectDir);
+  if (!isTeamUnitOwnership(readStateFile(pd))) fail("The lead's sign-off is for work that teams build.");
+  withAuditLock(pd, () => writeStateFile(pd, setRuntimeField(readStateFile(pd), LEAD_SIGNOFF_FIELD, value)));
+  console.log(JSON.stringify({
+    lead_sign_off: value,
+    notice: value === "on"
+      ? "Each team's result now waits for your sign-off before its Unit counts as done."
+      : "A team's Unit counts as done once every repo it changed has merged; no sign-off is asked.",
+  }));
+}
+
+export function signOffAskName(unit: string): string {
+  return `signoff-${unit}.json`;
+}
+
+// The lead signs a team's result off, in their own words, under the rules for
+// a person's answer.
+function signOff(args: string[], projectDir?: string): void {
+  const { positional, flags } = parseArgs(args);
+  const unit = positional[0];
+  const words = flags["person-words"]?.trim() ?? "";
+  if (!unit) fail("Usage: aidlc-unit sign-off <unit> --person-words '<their words>'");
+  const pd = resolveProjectDir(projectDir);
+  const identity = activeIdentity(pd);
+  const remote = repositoryRemote(pd);
+  const live = currentClaim(pd, remote, claimRef(identity.intentId8, unit));
+  if (live?.status !== "claimed" || !live.payload.result) fail(`${unit} has no result from its team to sign off.`);
+  if (!humanPresenceGuardDisabled() && !personAskedSinceGate(pd)) {
+    fail("The sign-off is the person's own word: ask them first, then run this with their words.");
+  }
+  const payload: UnitClaimPayload = { ...live.payload, predecessor_oid: live.oid, signoff: { words, at: isoTimestamp() } };
+  const sent = updateClaimRef(pd, remote, live.ref, createClaimCommit(pd, live.oid, payload), live.oid);
+  if (!sent.ok) fail(`${unit}'s claim moved meanwhile: ${sent.refused ?? "try again"}.`);
+  invalidateLiveClaimPayloadCache(pd, unit);
+  appendAuditEntry("QUESTION_ANSWERED", { Question: `Sign off ${unit} from ${live.owner}`, Answer: "Sign it off", "Person Reply": words }, pd);
+  console.log(JSON.stringify({ unit, notice: `Signed off ${unit}; it counts as done once every repo it changed has merged.` }));
+}
+
 function participate(projectDir?: string): void {
   const pd = resolveProjectDir(projectDir);
   writeFileSync(unitParticipantPath(pd), "participant\n", "utf-8");
@@ -3658,6 +5324,14 @@ function participate(projectDir?: string): void {
 }
 
 let projectDir: string | undefined;
+
+// Every verb main runs. The dispatcher routes the same list (aidlc.ts, the unit
+// routes), and t-unit-native-commands holds the two together.
+export const UNIT_VERBS = [
+  "assign", "take", "push", "hand-off", "progress", "take-in", "propose", "amend", "lead-sign-off", "sign-off",
+  "turned-down", "merged", "adopt", "claim", "release", "participate", "publish", "pin", "gate", "land",
+  "merge-status", "status",
+] as const;
 
 export function main(argv: string[]): void {
   const args = [...argv];
@@ -3668,7 +5342,19 @@ export function main(argv: string[]): void {
   }
   const command = args.shift();
   try {
-    if (command === "adopt") adoptUnit(args, projectDir);
+    if (command === "assign") assignUnits(args, projectDir);
+    else if (command === "take") takeUnit(args, projectDir);
+    else if (command === "push") pushUnit(args, projectDir);
+    else if (command === "hand-off") handOff(args, projectDir);
+    else if (command === "progress") progressFile(projectDir);
+    else if (command === "take-in") takeIn(args, projectDir);
+    else if (command === "propose") proposeChange(args, projectDir);
+    else if (command === "amend") amendInput(args, projectDir);
+    else if (command === "lead-sign-off") leadSignOffSetting(args, projectDir);
+    else if (command === "sign-off") signOff(args, projectDir);
+    else if (command === "turned-down") turnedDown(args, projectDir);
+    else if (command === "merged") saidMerged(args, projectDir);
+    else if (command === "adopt") adoptUnit(args, projectDir);
     else if (command === "claim") claimUnit(args, projectDir);
     else if (command === "release") releaseUnit(args, projectDir);
     else if (command === "participate") participate(projectDir);
@@ -3689,7 +5375,7 @@ export function main(argv: string[]): void {
       console.log(JSON.stringify(unitClaimOverview(resolveProjectDir(projectDir)), null, 2));
     } else {
       fail(
-        "Usage: aidlc-unit <adopt|claim|release|participate|publish|pin|gate|land|merge-status|status> ...",
+        `Usage: aidlc-unit <${UNIT_VERBS.join("|")}> ...`,
       );
     }
   } catch (error) {

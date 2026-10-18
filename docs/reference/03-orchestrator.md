@@ -623,9 +623,125 @@ a line waits past the step that settles the walking skeleton's stance, which
 the agent passes through without speaking. Showing the question notes an engine ask mark; once a
 human turn is on record after it with no answer recorded, the question is not
 put again and the first step carries one line that this session builds the
-Units and how to ask for teams. Work with recorded repos is never asked: the
-first step carries `teamsAcrossReposLine` instead, the line the setter's
-refusal also says.
+Units and how to ask for teams. Work with recorded repos in a workspace that
+is not a git repository is never asked: the first step carries
+`teamsAcrossReposLine` instead, the line the setter's refusal also says. In a
+workspace in git, it is asked like any work, and choosing teams records the
+home.
+
+When choosing teams recorded `Home Location` (the workspace is a Git
+repository: its `origin` address, or `local`), the next step is `ask_type:
+unit-assignment` instead, asked once before any Unit starts: who builds which
+Unit, each named with its likely repos and the Units it waits on. The person
+answers in their own words; the agent runs `assign_command` (`unit assign
+<unit>=<team> ... --person-words`) with the Units they named, or the **Leave
+them all open** choice's command. A `UNITS_ASSIGNED` row after the latest team
+`UNIT_OWNERSHIP_SET` settles it. The home then walks only the Units no team
+holds, skipping a Unit that waits, directly or through another, on one a team
+holds and has not merged; when none is left to it while a held Unit is
+unmerged, the step is the team board as a `notice`. Team work without `Home
+Location` keeps the dispatcher flow.
+
+In a team member's workspace, a plain `next` with no work selected returns
+`ask_type: unit-take` when a home with `Home Location` is visible here and the
+person has no other unfinished work in the selected space. It is read from
+what the workspace already has, with no network: each home's Unit plan and
+Unit Progress, the claims git last brought in (or the home's latest
+`UNITS_ASSIGNED` row for a Unit whose claim is not here yet), and the builds
+in this workspace. Its choices are **Start <unit>** for each Unit the person's
+team can take now, **Carry on <unit>** for a build already here (any space),
+and **Carry on <work> here, as its home** when the home's record is in the
+selected space and this workspace is the home's own; each runs one command
+(`unit take`, or `next --pick`). The home's work that git copied into a team's
+own workspace (its `Home Location` is not this workspace's `origin`) is never
+offered to carry on, and `workToPickUp` leaves it out.
+
+A Unit's build is solo work with one Unit: its state records `Unit Build`,
+`Home Location`, `Home Work`, `Home Record` and `Home Attempt`;
+`resolveBoltDag` returns that Unit alone; the home's Inception stages are
+`[x]` with `SKIP`, so per-Unit paths stay per-Unit; `Construction Iteration` is
+`stage-major` for the per-stage team rhythm and `unit-major` with checkpoints
+for `unit-end`; `Skeleton Stance` is `off`.
+
+When a build has no stage left, `next` returns `ask_type: unit-push` until its
+state records `Unit Push: pushed`: **Push** runs `unit push`, **Not now** runs
+`unit push --later` (then the end carries one line that it is not pushed yet).
+The push's result rides the Unit's claim (`result`: per repo the branch, base,
+heads, changed blobs and patch-id; the outputs the home's later stages read, as
+files under `.aidlc-unit-result/` in the claim commit's tree). A home with
+`Home Location`, and a Unit's build not by file, run `refreshHomeClaims`: one
+fetch of `refs/heads/claim/<id8>/*` into the refs the person's own fetch uses
+(or, by the home's address, into `refs/aidlc/home/<id8>/`), once per chat
+(noted in `aidlc/.aidlc-sessions/claims-fetched.json`) and, at the home, again
+at each step that shows or acts on the claims (nothing left for the home to
+build now, a result to check, a proposal to answer). That fetch and the merge
+check's fetches go through `quietFetch`: `GIT_TERMINAL_PROMPT=0`,
+`GCM_INTERACTIVE=never` and ssh `BatchMode=yes` for that call only (a `GIT_SSH`
+program is left as it is), and a 15-second timeout. When a remote cannot be
+reached the last fetch stands, with one line that the board, or the build's news
+from the home, may be behind. At the home,
+while a team holds a Unit, each step runs `checkTeamResults`: it fetches each
+repo of every pushed Unit not yet done, runs `unitMergeVerdict` (the last head
+is an ancestor; or a first-parent commit after the base holds every changed
+blob and none of the deleted paths; or one first-parent commit has the same
+patch-id), puts the verdicts on the claim, and once every repo merged records
+`UNIT_MERGED` with `Built By` under the per-intent lock, writes the outputs into
+the home's record and marks the claim `done`. The home's Unit Progress shows a
+Unit merged that way with every stage done. While a team still holds a Unit and
+none is left to the home, the step is the board (`renderUnitBoard`). A
+`turned_down` note on the claim reaches the build once, on any step. The lead's
+word that a repo merged where the check cannot see it (`unit merged <unit> --repo
+<repo> --person-words`) goes on the claim as `said_merged`, and that repo's
+verdict reads merged "by your word" from then on. The board carries
+`board_note`, the commands for both; a Unit's build left unpushed ends with
+`done_note`, the push command. `unit turned-down`, `unit merged`, `unit amend`
+and `unit sign-off` record the lead's word only with a turn of theirs behind it
+(`personAskedSinceGate`, unless the human-presence guard is off). The merge
+check's claim reads and its write of the verdicts and `done` (a
+`--force-with-lease` push of the claim ref) run under the same quiet git as the
+claims fetch; an unwritten verdict stays local, the board line says it may be
+behind, and the next step writes it again.
+
+When the person's words are the path of a file carrying the `aidlc-handoff`
+mark, `next` returns `ask_type: unit-handoff` (**Start <unit>** runs
+`unit take --file <path>`; **Not now** runs nothing); the path of a file
+carrying the `aidlc-result` or `aidlc-progress` mark returns a run-then-continue
+`print` that runs `unit take-in <path>`. A build started from a
+file records `Home Result: by file`; its push writes a result file in place of
+the claim, and `unit take-in` at the home puts a result or progress file onto
+the claim (`result`, `progress`). A claim held by `unit hand-off` carries
+`by_file`, and the board says "handed off by file".
+
+The take offer adds **Start <unit> early** for a waiting Unit once every Unit
+it waits on has a result on its claim (`unit take --early`, recorded as
+`early_on`). At the home, a claim with a proposal nobody answered makes the
+step `ask_type: unit-amend` (noted with an engine ask mark; after the person
+spoke without answering, the step carries one line instead), with
+`amend_command` for the person's words. `buildClaimNotes` says each note on a
+build's own claim once, on any step: a turn-down, the home's answer to a
+proposal, an `early_on` Unit done or turned down, and an amendment, which also
+writes the new version into the build's copy and appends `SHARED_INPUT_AMENDED`
+for the build's stages that used it, so its own validity check stays quiet and
+the line (`staleStageLine`, or the follow-up offer for a done Unit) comes from
+the amendment alone. `completionReceiptsFromAudit` reads `SHARED_INPUT_AMENDED`
+as it reads `STAGE_DEFINITION_CHANGED`.
+
+Solo work built unit-major whose last per-Unit row is in another clone's audit
+shard (`builtFromAnotherMachine`), committed by another git identity
+(`lastCommittedByThisPerson`: `user.email`, else `user.name`), is offered, at a
+plain `next` with no work selected, as `ask_type: unit-take` with **Carry on**
+(`next --pick`), **Take <unit>** for each Unit not started and not waiting, and
+**Follow along** (`status` for that record); the same person's second machine
+gets today's pickup. `unit take` on such work claims the Unit at the
+workspace's `origin` and builds it in the home's space; it writes nothing of
+the home's state. At the start of every `next`, `switchSoloToTeams` switches
+solo unit-major work whose claim refs (brought by git) show a taken Unit:
+`Unit Ownership: team`, `Home Location` (its origin), `Unit Gate Rhythm:
+unit-end`, `UNIT_OWNERSHIP_SET` with a `Reason`, and `UNIT_MERGED` (`Merged In:
+built here before teams`) for each Unit its own walk finished; the step carries
+one line. With `Lead Sign-off: on`, a claim with a result and no `signoff`
+makes the home's step `ask_type: unit-signoff` once (with `signoff_command`),
+and `checkTeamResults` records done only after the sign-off.
 
 When skeleton-on applies, the first DAG Unit must be planned as the smallest
 working integrated slice. It completes its applicable per-unit stages before

@@ -147,6 +147,7 @@ import {
   localUnitClaimOverviewForIntent,
   main as unitMain,
 } from "./aidlc-unit.ts";
+import { homeLocation } from "./aidlc-unit-teams.ts";
 import {
   codeGenerationBuildsWithoutSource,
   PLAN_APPROVAL_REPAIR_SOURCE_BOUNDARY_REMEDY,
@@ -439,6 +440,7 @@ import {
   KIRO_CONDUCTOR_AGENT_FILE,
   PERSON_ASKED_SKIP_REASON,
 } from "./aidlc-lib.ts";
+import { repoNotThereLine } from "./aidlc-workspace-manifest.ts";
 import { GUARD_POLICY_GLOSS, SCOPE_GLOSS } from "./aidlc-guard-fences.ts";
 import { validateStageFrontmatter } from "./aidlc-stage-schema.ts";
 import { isRuleStale } from "./aidlc-rule-schema.ts";
@@ -7079,6 +7081,8 @@ const SUBMODULE_INIT_REMEDY = "git submodule update --init --recursive";
 export const PROJECT_TYPE_SOURCE_FIELD = "Project Type Source";
 export const PROJECT_TYPE_SOURCE_SCAN = "workspace scan";
 export const PROJECT_TYPE_SOURCE_PERSON = "you";
+// A team's build of one Unit takes the type its home's work settled.
+export const PROJECT_TYPE_SOURCE_HOME = "the home";
 
 export function declaredProjectType(value: string | undefined): "Greenfield" | "Brownfield" | null {
   const word = value?.trim().toLowerCase();
@@ -8377,6 +8381,8 @@ function handleIntentCreate(projectDir: string, flags: Record<string, string>): 
       repos,
       initialSelection.sessionId ?? undefined,
       questionId,
+      // A Unit's build keeps its row in its own folder (aidlc-unit take).
+      flags["keep-entry-in-record"] !== undefined,
     );
     failIntentCreateAt("after-list");
     if (teamKeptCheck !== null && initialSelection.sessionId) {
@@ -9283,8 +9289,9 @@ function handleIntentRepos(
       if (boxes.get("units-generation") === "completed") return { kind: "cutoff" as const };
       if (verb === "add-repo") {
         if (current.includes(name)) return { kind: "already" as const };
+        if (!existsSync(repoDir(projectDir, name))) die(`intent add-repo refused: ${repoNotThereLine(projectDir, name)}`);
         if (!isGitRepoDir(repoDir(projectDir, name))) {
-          die(`intent add-repo refused: "${name}" is not a Git checkout under the workspace folder (no .git entry at ${repoDir(projectDir, name)}). Clone or create the repo there first.`);
+          die(`intent add-repo refused: "${name}" is not a Git checkout (no .git entry at ${repoDir(projectDir, name)}). Clone or create the repo there first.`);
         }
       } else {
         if (!current.includes(name)) return { kind: "absent" as const, current };
@@ -11050,7 +11057,10 @@ export function projectTypeRecordedAsPersons(content: string, type: string): boo
 // that scan so the question can say what was found; null otherwise.
 export function greenfieldWorkspaceGainedCode(projectDir: string, content: string): ScanResult | null {
   if (declaredProjectType(getField(content, "Project Type") ?? "") !== "Greenfield") return null;
-  if (getField(content, PROJECT_TYPE_SOURCE_FIELD) === PROJECT_TYPE_SOURCE_PERSON) return null;
+  const source = getField(content, PROJECT_TYPE_SOURCE_FIELD);
+  if (source === PROJECT_TYPE_SOURCE_PERSON || source === PROJECT_TYPE_SOURCE_HOME) return null;
+  // Teams build this work: the code their Units merge is its own.
+  if (homeLocation(content) !== null) return null;
   if (constructionHasStarted(content, recordDir(projectDir))) return null;
   const scan = detectWorkspace(projectDir);
   return scan.projectType === "Brownfield" ? scan : null;
