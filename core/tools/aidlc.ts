@@ -217,6 +217,61 @@ export const SYSTEM_NAMESPACE_HELP: NamespaceHelpOptions = {
   header: "Operations on this user's aidlc installation; never system-wide (root only with --allow-root):",
 };
 
+// The unit tool's verbs, routed at both doors: `aidlc unit`, which people and
+// scripts type, and `aidlc engine unit`, the form aidlcToolInvocation prints for
+// the agent on a native install. The tool's own list is UNIT_VERBS in
+// aidlc-unit.ts; the dispatcher does not load that module, so the two are held
+// together by t-unit-native-commands.
+const UNIT_VERBS = [
+  "adopt",
+  "amend",
+  "assign",
+  "claim",
+  "gate",
+  "hand-off",
+  "land",
+  "lead-sign-off",
+  "merge-status",
+  "merged",
+  "participate",
+  "pin",
+  "progress",
+  "propose",
+  "publish",
+  "push",
+  "release",
+  "sign-off",
+  "status",
+  "take",
+  "take-in",
+  "turned-down",
+] as const;
+
+const UNIT_FORMS = [
+  "unit adopt <unit>",
+  "unit amend <unit> --input <file> --answer <approve|reject> --person-words <text>",
+  "unit assign <unit>=<team> [<unit>=<team> ...] [--person-words <text>] | --open",
+  "unit claim <unit>",
+  "unit gate <unit> --decision <approve|reject> --user-input <text>",
+  "unit hand-off <unit> --team <team> [--person-words <text>]",
+  "unit land <unit> [--step git|state|audit|all] [--target <branch>] [--accept-released-attempt --user-input <text>]",
+  "unit lead-sign-off on|off",
+  "unit merge-status <unit>",
+  "unit merged <unit> --repo <repo> --person-words <text>",
+  "unit participate",
+  "unit pin <unit>",
+  "unit progress",
+  "unit propose --input <file> [--file <changed text>] [--person-words <text>]",
+  "unit publish <unit>",
+  "unit push [--later]",
+  "unit release <unit>",
+  "unit sign-off <unit> --person-words <text>",
+  "unit status",
+  "unit take <unit> --home <record> [--home-space <space>] [--team <label>] [--early] | --file <file>",
+  "unit take-in <file>",
+  "unit turned-down <unit> --repo <repo> --person-words <text>",
+] as const;
+
 // ROUTES_TABLE_START
 export const ROUTES: readonly Route[] = [
   {
@@ -246,36 +301,23 @@ export const ROUTES: readonly Route[] = [
     group: "unit",
     kind: "noun-passthrough",
     classification: "passthrough",
-    verbs: [
-      "adopt",
-      "assign",
-      "claim",
-      "gate",
-      "land",
-      "merge-status",
-      "participate",
-      "pin",
-      "publish",
-      "release",
-      "status",
-    ],
+    verbs: UNIT_VERBS,
     tool: TOOLS.unit,
     ...PUBLIC_ENGINE,
     namespace: "public",
     mutationScope: "project",
-    all: [
-      "unit adopt <unit>",
-      "unit assign <unit>=<team> [<unit>=<team> ...] [--person-words <text>] | --open",
-      "unit claim <unit>",
-      "unit gate <unit> --decision <approve|reject> --user-input <text>",
-      "unit land <unit> [--step git|state|audit|all] [--target <branch>] [--accept-released-attempt --user-input <text>]",
-      "unit merge-status <unit>",
-      "unit participate",
-      "unit pin <unit>",
-      "unit publish <unit>",
-      "unit release <unit>",
-      "unit status",
-    ],
+    all: UNIT_FORMS,
+  },
+  {
+    id: "engine-unit",
+    group: "unit",
+    kind: "noun-passthrough",
+    classification: "passthrough",
+    verbs: UNIT_VERBS,
+    tool: TOOLS.unit,
+    ...PUBLIC_ENGINE,
+    mutationScope: "project",
+    all: UNIT_FORMS,
   },
   {
     id: "top-compose",
