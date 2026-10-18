@@ -29998,7 +29998,9 @@ export function validateLiveUnitScope(
   if (!isTeamUnitOwnership(state)) return null;
   const stamp = applicableTeamUnitScopeStamp(pd, state);
   if (!stamp) {
-    if (cachedClaimFanoutActive(pd)) {
+    // The home of teams that build their Units as work of their own works the
+    // Units no team holds itself.
+    if (cachedClaimFanoutActive(pd) && unitTeams().homeLocation(state) === null) {
       throw new Error(
         "Team Unit fan-out is active in an unscoped checkout; claim a Unit before lifecycle or report work.",
       );
