@@ -11008,6 +11008,7 @@ function routeNext(agentArgs: string[], projectDir: string | undefined): void {
       return;
     }
     // No stage left to run — the workflow is complete.
+    const notPushed = unitBuildOf(stateContent) !== null && getField(stateContent ?? "", UNIT_PUSH_FIELD)?.trim() === "later";
     emit({
       kind: "done",
       reason: `Workflow complete — no in-scope stage remains after ${currentSlug} (scope: ${scope}).${NEW_WORK_HINT}`,
@@ -11015,6 +11016,7 @@ function routeNext(agentArgs: string[], projectDir: string | undefined): void {
       // loop bookkeeping (a report landed, a read-only command already ran) and
       // stay silent: the user did not ask about the round-trip.
       narration: "That is everything on the plan. Your work is finished and written up.",
+      ...(notPushed ? { done_note: `When the person says push, run \`${aidlcToolInvocation("unit")} push\` and say its notice line.` } : {}),
     });
     return;
   }
@@ -13588,7 +13590,13 @@ function emitTeamUnitMajorRunStage(
       }
       return { unit, team, status: payload.taken_by ? `building, taken by ${payload.taken_by}` : `held for ${team}, not taken yet` };
     });
-    emit(noticeDirective(renderUnitBoard(workLabel(projectDir), rows)));
+    const unitTool = aidlcToolInvocation("unit");
+    emit({
+      ...noticeDirective(renderUnitBoard(workLabel(projectDir), rows)),
+      board_note: "Show the board as it is. When the person says a repo turned a Unit down, run " +
+        `\`${unitTool} turned-down <unit> --repo <repo> --person-words '<their words>'\`; when they say a repo merged it ` +
+        `where the board does not see it, run \`${unitTool} merged <unit> --repo <repo> --person-words '<their words>'\`.`,
+    });
     return;
   }
   if (scopeStamp) {
