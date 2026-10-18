@@ -4503,11 +4503,18 @@ export function appendIntentToRegistry(
   writeIntentRegistry(projectDir, list, space);
 }
 
+// The build-out's own module (aidlc-unit-teams.ts) imports this file, so it is
+// required lazily.
+const unitTeams = (): typeof import("./aidlc-unit-teams.ts") => require("./aidlc-unit-teams.ts");
+
 // Write a space's registry. A file git left conflicted was read as every row of
 // both sides, so this write keeps them all; the person hears once that git
 // still shows the file as conflicted. Their git is theirs: nothing is staged.
-export function writeIntentRegistry(projectDir: string, list: IntentRegistryEntry[], space?: string): void {
+// A row its own record folder keeps (a Unit's build) is written back there.
+export function writeIntentRegistry(projectDir: string, all: IntentRegistryEntry[], space?: string): void {
+  const list = unitTeams().keepRecordKeptEntries(projectDir, all, space);
   const path = intentsRegistryPath(projectDir, space);
+  if (list.length === 0 && all.length > 0 && !existsSync(path)) return;
   let conflicted = false;
   try {
     conflicted = CONFLICT_START.test(readFileSync(path, "utf-8"));
@@ -4570,8 +4577,14 @@ export function spacesRoot(projectDir: string): string {
 // canonical "what intents exist" record for humans/ordering/status — the cheap
 // on-disk listIntentDirs() scan is the path-resolver's record-presence signal,
 // but the registry carries the uuid/status/scope/repos a human or the --json
-// consumer needs.
+// consumer needs. A Unit's build keeps its row in its own record folder, and
+// is listed here with the rest.
 export function readIntentRegistry(projectDir: string, space?: string): IntentRegistryEntry[] {
+  const listed = readListedIntents(projectDir, space);
+  return [...listed, ...unitTeams().recordKeptEntries(projectDir, listed, space)];
+}
+
+function readListedIntents(projectDir: string, space?: string): IntentRegistryEntry[] {
   let text: string;
   try {
     text = readFileSync(intentsRegistryPath(projectDir, space), "utf-8");
@@ -4662,7 +4675,7 @@ export function workToPickUp(
   const recorded = listIntents(projectDir, space, selectedIntent).filter((intent) => !isArchivedIntent(intent));
   if (recorded.length === 0 || recorded.some((intent) => intent.active)) return null;
   const unfinished = recorded.map((intent) => ({ intent, state: recordStateText(projectDir, intent, space) }))
-    .filter(({ intent, state }) => !isFinishedWork(intent, state));
+    .filter(({ intent, state }) => !isFinishedWork(intent, state) && !unitTeams().isHomesCopiedWork(projectDir, state));
   return unfinished.some(({ intent }) => intent.dirName) ? unfinished : null;
 }
 
@@ -8271,20 +8284,19 @@ export function registerIntentRecord(
   repos?: string[],
   sessionId?: string,
   request?: string,
+  keepInRecord = false,
 ): void {
-  appendIntentToRegistry(
-    projectDir,
-    {
-      uuid: minted.uuid,
-      slug: minted.slug,
-      dirName: minted.dirName,
-      scope,
-      repos: repos && repos.length > 0 ? repos : undefined,
-      status: "in-flight",
-      ...(request ? { request } : {}),
-    },
-    minted.space,
-  );
+  const entry: IntentRegistryEntry = {
+    uuid: minted.uuid,
+    slug: minted.slug,
+    dirName: minted.dirName,
+    scope,
+    repos: repos && repos.length > 0 ? repos : undefined,
+    status: "in-flight",
+    ...(request ? { request } : {}),
+  };
+  if (keepInRecord) unitTeams().keepIntentEntryInRecord(projectDir, entry, minted.space);
+  else appendIntentToRegistry(projectDir, entry, minted.space);
   if (selectIntentForSession(projectDir, minted.dirName, minted.space, sessionId)) return;
   leaveCreationReceipt(minted.recordDir, minted.uuid);
 }
@@ -44281,8 +44293,12 @@ function boltDagMatches(a: ResolvedBoltDag, b: ResolvedBoltDag): boolean {
 // exists: a valid cache is accepted only when its batches and unit kinds still
 // match that artifact. Callers must keep the three states distinct: "none" is a
 // real no-DAG workflow, while "malformed" means the unit set is unknowable and
-// must fail closed.
-export function resolveBoltDag(
+// must fail closed. A Unit's build sees only its own Unit.
+export function resolveBoltDag(projectDir: string, intent?: string, space?: string): BoltDagResolution {
+  return unitTeams().onlyTheBuildsUnit(projectDir, resolveAuthoredBoltDag(projectDir, intent, space), intent, space);
+}
+
+function resolveAuthoredBoltDag(
   projectDir: string,
   intent?: string,
   space?: string,

@@ -8372,6 +8372,8 @@ function handleIntentCreate(projectDir: string, flags: Record<string, string>): 
       repos,
       initialSelection.sessionId ?? undefined,
       questionId,
+      // A Unit's build keeps its row in its own folder (aidlc-unit take).
+      flags["keep-entry-in-record"] !== undefined,
     );
     failIntentCreateAt("after-list");
     if (teamKeptCheck !== null && initialSelection.sessionId) {
