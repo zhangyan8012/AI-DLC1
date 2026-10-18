@@ -69,6 +69,7 @@ const VALID_EVENT_TYPES = new Set([
   // A finished stage AI-DLC itself now does differently: the row carries its
   // receipt for the new definition (aidlc-validity.ts).
   "STAGE_DEFINITION_CHANGED",
+  "SHARED_INPUT_AMENDED",
   // Phase lifecycle
   "PHASE_STARTED",
   "PHASE_COMPLETED",
@@ -302,6 +303,7 @@ const EVENT_HEADINGS: Record<string, string> = {
   STAGE_REVISING: "Stage Revising",
   STAGE_COMPLETED: "Stage Completion",
   STAGE_DEFINITION_CHANGED: "Stage Definition Changed",
+  SHARED_INPUT_AMENDED: "Shared Input Amended",
   STAGE_JUMPED: "Stage Jump",
   STAGE_SKIPPED: "Stage Skip",
   PHASE_STARTED: "Phase Start",
@@ -383,6 +385,9 @@ const EVENT_HEADINGS: Record<string, string> = {
   BOLT_FAILED: "Bolt Failed",
   AUTONOMY_MODE_SET: "Autonomy Mode Set",
   UNIT_OWNERSHIP_SET: "Unit Ownership Set",
+  UNITS_ASSIGNED: "Units Assigned",
+  UNIT_TAKEN_IN: "Unit Taken In",
+  UNIT_PUSHED: "Unit Pushed",
   UNIT_GATE_RHYTHM_SET: "Unit Gate Rhythm Set",
   CONSTRUCTION_POLICY_SET: "Construction Policy Set",
   UNIT_MERGED: "Unit Merged",
@@ -504,6 +509,7 @@ export interface AuditEntryInput {
 export const CLI_PROTECTED_EVENT_TYPES = new Set([
   "STAGE_COMPLETED",
   "STAGE_DEFINITION_CHANGED",
+  "SHARED_INPUT_AMENDED",
   "HUMAN_TURN",
   "HOST_TURN",
   "QUESTION_UNANSWERED",

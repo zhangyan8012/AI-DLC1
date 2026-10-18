@@ -42,7 +42,7 @@ shorter than what was said:
 - A picked option in a picker is kept only when it is one of a stage gate's own
   choices; other picked labels are the conductor's text, not the person's words.
 
-## Event Registry (122 events, 25 categories)
+## Event Registry (123 events, 25 categories)
 
 ### Workflow Lifecycle (7 events)
 
@@ -76,6 +76,7 @@ shorter than what was said:
 | `STAGE_JUMPED` | Forward/backward/redo jump target reached | Timestamp, Direction, Source, Target, Scope; optional Source Baseline. Backward jumps also carry JSON arrays for Changed Upstream Artifacts, Invalidated Downstream Artifacts, and Invalidated Downstream Reviews | `tools/aidlc-jump.ts execute` |
 | `STAGE_SKIPPED` | Current stage reports a justified skip, or under unit-major no unit owes the stage any more (each skipped or kind-vacuous), or a jump skips it (`[S]`) | Timestamp, Stage, Reason | `tools/aidlc-state.ts skip` (internally routed by `aidlc-orchestrate.ts report --result skipped`), `tools/aidlc-jump.ts execute` |
 | `STAGE_DEFINITION_CHANGED` | A finished stage's own definition changed (an AI-DLC update, a plugin, a stage edit) and nothing of the person's work did; the next step was spoken (it carried the line only when the stage now needs an input it did not need) | Timestamp, Stage, Validation Basis (the receipt for the new definition), Details (the line said, or that nothing was) | `aidlc-orchestrate.ts` |
+| `SHARED_INPUT_AMENDED` | A shared input a stage used was amended by the owner of the plan; its receipt for the new version stands in for the stage's completion receipt | Timestamp, Stage, Validation Basis, Input; optional Unit, Proposed By, Person Words, Amended At Home | `tools/aidlc-unit.ts amend`, a build taking the amendment in |
 
 ### Session Events (6 events - hook-owned, independent of workflow lifecycle)
 
@@ -435,7 +436,7 @@ Emitted by `aidlc attest anchor` when a commit is observed to have landed review
 
 Hooks emit events through the same library emitter as orchestrator-driven emissions (`appendAuditEntry` from `tools/aidlc-audit.ts`). Hook-emitted events are first-class taxonomy members (`ARTIFACT_CREATED`, `ARTIFACT_UPDATED`, `SUBAGENT_COMPLETED`, all `SESSION_*`). A hook with no active workflow in `cwd` is a no-op.
 
-The public `aidlc-audit.ts append` CLI is a diagnostic escape hatch, not the canonical emit path: it refuses the authority-bearing receipts in `CLI_PROTECTED_EVENT_TYPES` (`tools/aidlc-audit.ts`), which only their owning tool or hook may emit: `STAGE_COMPLETED`, `STAGE_DEFINITION_CHANGED`, `HUMAN_TURN`, `HOST_TURN`, `QUESTION_UNANSWERED`, `QUESTION_REPLIED`, `REQUEST_ROUTED`, `GATE_APPROVED`, `GATE_REJECTED`, `QUESTION_ANSWERED`, `PLAN_APPROVAL_RECORDED`, `PLAN_APPROVAL_OVERRIDDEN`, `PLAN_APPROVAL_SKIPPED`, `REVIEW_REQUESTED`, `REVIEW_COMPLETED`, `PIPELINE_LINK_COMPLETED`, `ARTIFACT_REUSED`, `SWARM_STARTED`, `SWARM_UNIT_CONVERGED`, `SWARM_SOURCE_MERGED`, `AUTONOMY_MODE_SET`, `UNIT_OWNERSHIP_SET`, `UNITS_ASSIGNED`, `UNIT_TAKEN_IN`, `UNIT_PUSHED`, `UNIT_GATE_RHYTHM_SET`, `CONSTRUCTION_POLICY_SET`, `UNIT_STARTED`, `UNIT_PAUSED`, `UNIT_RESUMED`, `UNIT_COMPLETED`, `UNIT_SKIPPED`, `UNIT_MERGED`, `DOCUMENT_INDEXED`, `DOCUMENT_UPDATED`, `DOCUMENT_REMOVED`, `BOLT_STARTED`, `BOLT_COMPLETED`, `BOLT_FAILED`, `AUDIT_FORKED`, `AUDIT_MERGED`, `STATE_FORKED`, `STATE_MERGED`, `WORKTREE_CREATED`, `WORKTREE_MERGED`, `WORKTREE_DISCARDED`, `SOURCE_COMMITTED`, `GUARD_POLICY_SET`, `CHANGE_CONTROL_SET`, `CHANGE_ACCEPTED`, `GUARD_RESTORED`, `GUARD_STOOD_ASIDE`, `CEREMONY_SET`. Field names must be printable single-line labels matching the audit field grammar; values have every line terminator escaped. `append-raw` likewise refuses a body carrying an `**Event**:` line naming a taxonomy event or an empty `**Event**:` line, and refuses line-breaking headings; the event readers take an `**Event**:` value from its own line only.
+The public `aidlc-audit.ts append` CLI is a diagnostic escape hatch, not the canonical emit path: it refuses the authority-bearing receipts in `CLI_PROTECTED_EVENT_TYPES` (`tools/aidlc-audit.ts`), which only their owning tool or hook may emit: `STAGE_COMPLETED`, `STAGE_DEFINITION_CHANGED`, `SHARED_INPUT_AMENDED`, `HUMAN_TURN`, `HOST_TURN`, `QUESTION_UNANSWERED`, `QUESTION_REPLIED`, `REQUEST_ROUTED`, `GATE_APPROVED`, `GATE_REJECTED`, `QUESTION_ANSWERED`, `PLAN_APPROVAL_RECORDED`, `PLAN_APPROVAL_OVERRIDDEN`, `PLAN_APPROVAL_SKIPPED`, `REVIEW_REQUESTED`, `REVIEW_COMPLETED`, `PIPELINE_LINK_COMPLETED`, `ARTIFACT_REUSED`, `SWARM_STARTED`, `SWARM_UNIT_CONVERGED`, `SWARM_SOURCE_MERGED`, `AUTONOMY_MODE_SET`, `UNIT_OWNERSHIP_SET`, `UNITS_ASSIGNED`, `UNIT_TAKEN_IN`, `UNIT_PUSHED`, `UNIT_GATE_RHYTHM_SET`, `CONSTRUCTION_POLICY_SET`, `UNIT_STARTED`, `UNIT_PAUSED`, `UNIT_RESUMED`, `UNIT_COMPLETED`, `UNIT_SKIPPED`, `UNIT_MERGED`, `DOCUMENT_INDEXED`, `DOCUMENT_UPDATED`, `DOCUMENT_REMOVED`, `BOLT_STARTED`, `BOLT_COMPLETED`, `BOLT_FAILED`, `AUDIT_FORKED`, `AUDIT_MERGED`, `STATE_FORKED`, `STATE_MERGED`, `WORKTREE_CREATED`, `WORKTREE_MERGED`, `WORKTREE_DISCARDED`, `SOURCE_COMMITTED`, `GUARD_POLICY_SET`, `CHANGE_CONTROL_SET`, `CHANGE_ACCEPTED`, `GUARD_RESTORED`, `GUARD_STOOD_ASIDE`, `CEREMONY_SET`. Field names must be printable single-line labels matching the audit field grammar; values have every line terminator escaped. `append-raw` likewise refuses a body carrying an `**Event**:` line naming a taxonomy event or an empty `**Event**:` line, and refuses line-breaking headings; the event readers take an `**Event**:` value from its own line only.
 
 ## Format Standards
 
@@ -494,4 +495,7 @@ any input or output it now reads or writes, or no longer does, or whose
 stale. Once the next step is spoken (it says so only when the stage now needs an
 input it did not need), the engine appends a `STAGE_DEFINITION_CHANGED` row whose
 `Validation Basis` is the stage's receipt for its new definition; it stands in
-for the completion receipt until the stage starts again.
+for the completion receipt until the stage starts again. A `SHARED_INPUT_AMENDED`
+row does the same for a stage that used a shared input the owner of the plan
+amended (`aidlc-unit.ts amend` at the home, and a team's build taking the
+amendment in).
